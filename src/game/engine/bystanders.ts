@@ -14,7 +14,17 @@ const SHIRT_COLORS = [0xd8432b, 0x2b6fd8, 0xe8b923, 0x3f9e52, 0xd84bb0, 0xf2f2f2
 const SKIN_COLORS = [0xe8b98a, 0xc98a5a, 0x8a5a3a, 0xf2d9b8];
 const PANTS_COLORS = [0x2b3a4a, 0x4a3a2b, 0x3a3a3a];
 
-function buildBystanderMesh(): { group: THREE.Group; armL: THREE.Object3D; armR: THREE.Object3D } {
+interface BystanderMesh {
+  group: THREE.Group;
+  armL: THREE.Object3D;
+  armR: THREE.Object3D;
+  legL: THREE.Object3D;
+  legR: THREE.Object3D;
+}
+
+const HIP_HEIGHT = 0.55;
+
+function buildBystanderMesh(): BystanderMesh {
   const group = new THREE.Group();
   const shirt = SHIRT_COLORS[Math.floor(Math.random() * SHIRT_COLORS.length)];
   const skin = SKIN_COLORS[Math.floor(Math.random() * SKIN_COLORS.length)];
@@ -24,10 +34,20 @@ function buildBystanderMesh(): { group: THREE.Group; armL: THREE.Object3D; armR:
   const skinMat = new THREE.MeshStandardMaterial({ color: skin, roughness: 0.7 });
   const pantsMat = new THREE.MeshStandardMaterial({ color: pants, roughness: 0.85 });
 
-  const legs = new THREE.Mesh(new THREE.CylinderGeometry(0.13, 0.13, 0.55, 6), pantsMat);
-  legs.position.y = 0.275;
-  legs.castShadow = true;
-  group.add(legs);
+  // Legs are separate meshes pivoted at the hip so they can swing during
+  // walking/running, instead of one static cylinder.
+  const legGeo = new THREE.CapsuleGeometry(0.1, 0.32, 3, 5);
+  legGeo.translate(0, -0.24, 0);
+
+  const legL = new THREE.Mesh(legGeo, pantsMat);
+  legL.position.set(0.09, HIP_HEIGHT, 0);
+  legL.castShadow = true;
+  group.add(legL);
+
+  const legR = new THREE.Mesh(legGeo, pantsMat);
+  legR.position.set(-0.09, HIP_HEIGHT, 0);
+  legR.castShadow = true;
+  group.add(legR);
 
   const torso = new THREE.Mesh(new THREE.CapsuleGeometry(0.16, 0.42, 3, 6), bodyMat);
   torso.position.y = 0.75;
@@ -50,7 +70,7 @@ function buildBystanderMesh(): { group: THREE.Group; armL: THREE.Object3D; armR:
   armR.position.set(-0.24, 0.9, 0);
   group.add(armR);
 
-  return { group, armL, armR };
+  return { group, armL, armR, legL, legR };
 }
 
 type BystanderState = "idle" | "dodging" | "ragdoll" | "recovering";
@@ -65,6 +85,8 @@ export class Bystander {
   readonly group: THREE.Group;
   private readonly armL: THREE.Object3D;
   private readonly armR: THREE.Object3D;
+  private readonly legL: THREE.Object3D;
+  private readonly legR: THREE.Object3D;
   private readonly home: THREE.Vector3;
   private readonly homeHeading: number;
   private readonly baseY: number;
@@ -76,10 +98,12 @@ export class Bystander {
   private ragTimer = 0;
 
   constructor(position: THREE.Vector3, outward: THREE.Vector3) {
-    const { group, armL, armR } = buildBystanderMesh();
+    const { group, armL, armR, legL, legR } = buildBystanderMesh();
     this.group = group;
     this.armL = armL;
     this.armR = armR;
+    this.legL = legL;
+    this.legR = legR;
     this.group.position.copy(position);
     this.home = position.clone();
     this.baseY = position.y;
@@ -106,17 +130,28 @@ export class Bystander {
     return closest;
   }
 
-  private cheerPose(rate: number) {
+  /** Bobbing/waving idle cheer, or -- with `running` -- a leg-pumping scramble. */
+  private cheerPose(rate: number, running: boolean) {
     this.phase += rate;
+    const legSwing = running ? 0.85 : 0.3;
     this.group.position.y = this.baseY + Math.max(0, Math.sin(this.phase)) * 0.12;
     this.armL.rotation.z = Math.sin(this.phase) * 0.9;
     this.armR.rotation.z = -Math.sin(this.phase + 0.6) * 0.9;
+    this.legL.rotation.x = Math.sin(this.phase) * legSwing;
+    this.legR.rotation.x = -Math.sin(this.phase) * legSwing;
+  }
+
+  private resetPose() {
+    this.armL.rotation.z = 0;
+    this.armR.rotation.z = 0;
+    this.legL.rotation.x = 0;
+    this.legR.rotation.x = 0;
   }
 
   update(dt: number, cars: Car[]) {
     switch (this.state) {
       case "idle": {
-        this.cheerPose(dt * 4);
+        this.cheerPose(dt * 4, false);
         const threat = this.findThreat(cars);
         if (threat) {
           this.state = "dodging";
@@ -143,7 +178,7 @@ export class Bystander {
           this.group.position.addScaledVector(toTarget, DODGE_SPEED * dt);
           this.group.rotation.y = Math.atan2(toTarget.x, toTarget.z);
         }
-        this.cheerPose(dt * 11);
+        this.cheerPose(dt * 11, true);
         if (!threat && dist <= 0.15) this.state = "idle";
         break;
       }
@@ -178,6 +213,7 @@ export class Bystander {
 
     this.state = "ragdoll";
     this.ragTimer = 0;
+    this.resetPose();
     this.rag.velocity.copy(car.velocity).multiplyScalar(0.7);
     this.rag.velocity.y = 3 + Math.random() * 2;
     this.rag.angularVelocity.set((Math.random() - 0.5) * 10, (Math.random() - 0.5) * 6, (Math.random() - 0.5) * 10);

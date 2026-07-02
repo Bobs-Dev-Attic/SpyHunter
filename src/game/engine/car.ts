@@ -45,6 +45,24 @@ const TIRE_DETACH_DAMAGE = 0.8;
 const FIRE_DAMAGE = 0.75;
 const TIRE_GRIP_PENALTY = 0.18;
 const TIRE_SPEED_PENALTY = 0.12;
+// A missing front wheel drags on its rim, both fighting the steering and
+// constantly pulling the nose toward that side. A missing rear wheel instead
+// lets the back end step out much more readily (fishtail/oversteer) without
+// directly fighting the driver's input.
+const FRONT_TIRE_STEER_LOSS = 0.32;
+const FRONT_TIRE_HEADING_PULL = 0.4;
+const REAR_TIRE_GRIP_PENALTY = 0.32;
+const MIN_STEER_AUTHORITY = 0.35;
+const TIRE_LEAN_ROLL = 0.05;
+const TIRE_LEAN_PITCH = 0.035;
+// Local (x, z) offsets matching the wheelOffsets used to build the car mesh,
+// used to figure out which side/end a lost wheel was on.
+const WHEEL_LOCAL_XZ: readonly [number, number][] = [
+  [0.52, 0.68],
+  [-0.52, 0.68],
+  [0.55, -0.68],
+  [-0.55, -0.68],
+];
 
 export interface DetachEvent {
   mesh: THREE.Object3D;
@@ -356,6 +374,25 @@ export class Car {
     const maxFwd = MAX_SPEED * speedScale * (1 - tireLossCount * TIRE_SPEED_PENALTY);
     forwardSpeed = THREE.MathUtils.clamp(forwardSpeed, -MAX_REVERSE_SPEED, maxFwd);
 
+    // A lost front wheel drags on the bare hub -- it robs steering authority
+    // and constantly hauls the nose toward that side. A lost rear wheel
+    // doesn't fight the wheel directly, but the rear end loses grip much
+    // more readily, so the tail steps out into a fishtail on its own.
+    let steerAuthority = 1;
+    let headingPull = 0;
+    let rearGripPenalty = 0;
+    for (let i = 0; i < 4; i++) {
+      if (!this.tireLost[i]) continue;
+      const [wx, wz] = WHEEL_LOCAL_XZ[i];
+      if (wz > 0) {
+        steerAuthority -= FRONT_TIRE_STEER_LOSS;
+        headingPull += Math.sign(wx) * FRONT_TIRE_HEADING_PULL;
+      } else {
+        rearGripPenalty += REAR_TIRE_GRIP_PENALTY;
+      }
+    }
+    steerAuthority = Math.max(MIN_STEER_AUTHORITY, steerAuthority);
+
     // Turn authority ramps up with actual rolling speed and is ~0 at a
     // standstill — steering alone can no longer spin the car in place.
     // Negated: with forward = (sin(heading), 0, cos(heading)), increasing
@@ -364,10 +401,11 @@ export class Car {
     // heading to actually turn the car right.
     const speedForTurn = 1 - Math.exp(-Math.abs(forwardSpeed) / TURN_SPEED_RAMP);
     const reverseSign = forwardSpeed < 0 ? -1 : 1;
-    const turnRate = -input.steer * MAX_TURN_RATE * speedForTurn * reverseSign;
-    this.heading += turnRate * dt;
+    const turnRate = -input.steer * MAX_TURN_RATE * speedForTurn * reverseSign * steerAuthority;
+    this.heading += (turnRate + headingPull * speedForTurn) * dt;
 
-    const grip = (input.handbrake ? GRIP_DRIFT : surface.grip) * (1 - tireLossCount * TIRE_GRIP_PENALTY);
+    const gripPenalty = Math.min(0.85, tireLossCount * TIRE_GRIP_PENALTY + rearGripPenalty);
+    const grip = (input.handbrake ? GRIP_DRIFT : surface.grip) * (1 - gripPenalty);
     const slipMagnitude = Math.abs(lateralSpeed);
     lateralSpeed *= Math.max(0, 1 - grip * dt);
 
@@ -394,8 +432,17 @@ export class Car {
 
     this.visualSteer = THREE.MathUtils.lerp(this.visualSteer, -input.steer * MAX_VISUAL_STEER, 1 - Math.pow(0.001, dt));
 
-    const targetRoll = THREE.MathUtils.clamp(-lateralSpeed * 0.055, -0.22, 0.22);
-    const targetPitch = THREE.MathUtils.clamp(-forwardAccel * 0.014, -0.14, 0.14);
+    let leanRollBias = 0;
+    let leanPitchBias = 0;
+    for (let i = 0; i < 4; i++) {
+      if (!this.tireLost[i]) continue;
+      const [wx, wz] = WHEEL_LOCAL_XZ[i];
+      leanRollBias += -Math.sign(wx) * TIRE_LEAN_ROLL;
+      leanPitchBias += Math.sign(wz) * TIRE_LEAN_PITCH;
+    }
+
+    const targetRoll = THREE.MathUtils.clamp(-lateralSpeed * 0.055 + leanRollBias, -0.34, 0.34);
+    const targetPitch = THREE.MathUtils.clamp(-forwardAccel * 0.014 + leanPitchBias, -0.2, 0.2);
     this.suspension.rotation.z = THREE.MathUtils.lerp(this.suspension.rotation.z, targetRoll, 1 - Math.pow(0.0015, dt));
     this.suspension.rotation.x = THREE.MathUtils.lerp(this.suspension.rotation.x, targetPitch, 1 - Math.pow(0.0015, dt));
     const bob = Math.max(0, Math.abs(lateralSpeed) * 0.004) + this.impactPulse * 0.12;
