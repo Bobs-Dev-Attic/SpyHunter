@@ -245,3 +245,108 @@ export class SkidMarks {
     (this.mesh.geometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
   }
 }
+
+let bloodSplatTexture: THREE.CanvasTexture | null = null;
+
+/** A dark-red irregular splat, alpha-blended so it reads as a stain rather than a flat circle. */
+function getBloodSplatTexture(): THREE.CanvasTexture {
+  if (bloodSplatTexture) return bloodSplatTexture;
+  const size = 64;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d")!;
+  const cx = size / 2;
+  const cy = size / 2;
+
+  for (let i = 0; i < 6; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const dist = Math.random() * size * 0.22;
+    const bx = cx + Math.cos(angle) * dist;
+    const by = cy + Math.sin(angle) * dist;
+    const r = size * (0.12 + Math.random() * 0.22);
+    const gradient = ctx.createRadialGradient(bx, by, 0, bx, by, r);
+    gradient.addColorStop(0, "rgba(94,10,10,0.9)");
+    gradient.addColorStop(0.6, "rgba(74,6,6,0.6)");
+    gradient.addColorStop(1, "rgba(74,6,6,0)");
+    ctx.fillStyle = gradient;
+    ctx.beginPath();
+    ctx.arc(bx, by, r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  bloodSplatTexture = new THREE.CanvasTexture(canvas);
+  return bloodSplatTexture;
+}
+
+const BLOOD_LIFETIME = 25;
+const BLOOD_FADE_DURATION = 5;
+
+interface BloodSlot {
+  mesh: THREE.Mesh;
+  material: THREE.MeshBasicMaterial;
+  age: number;
+  active: boolean;
+}
+
+/**
+ * Small pool of ground decals for bystander injuries. Each spawn reuses the
+ * oldest slot (or an inactive one), so this never allocates once warmed up.
+ * Fades out and hides itself after BLOOD_LIFETIME seconds.
+ */
+export class BloodDecals {
+  readonly group = new THREE.Group();
+  private readonly slots: BloodSlot[];
+  private cursor = 0;
+
+  constructor(maxDecals = 40) {
+    const texture = getBloodSplatTexture();
+    const geo = new THREE.PlaneGeometry(1, 1);
+    geo.rotateX(-Math.PI / 2);
+
+    this.slots = Array.from({ length: maxDecals }, () => {
+      const material = new THREE.MeshBasicMaterial({
+        map: texture,
+        transparent: true,
+        opacity: 0,
+        depthWrite: false,
+        polygonOffset: true,
+        polygonOffsetFactor: -1,
+        polygonOffsetUnits: -1,
+      });
+      const mesh = new THREE.Mesh(geo, material);
+      mesh.visible = false;
+      mesh.position.y = -50;
+      this.group.add(mesh);
+      return { mesh, material, age: BLOOD_LIFETIME, active: false };
+    });
+  }
+
+  spawn(position: THREE.Vector3, scale = 0.55) {
+    const slot = this.slots[this.cursor];
+    this.cursor = (this.cursor + 1) % this.slots.length;
+
+    slot.mesh.position.set(position.x, 0.018, position.z);
+    slot.mesh.rotation.y = Math.random() * Math.PI * 2;
+    slot.mesh.scale.setScalar(scale * (0.75 + Math.random() * 0.5));
+    slot.mesh.visible = true;
+    slot.material.opacity = 0.85;
+    slot.age = 0;
+    slot.active = true;
+  }
+
+  update(dt: number) {
+    for (const slot of this.slots) {
+      if (!slot.active) continue;
+      slot.age += dt;
+      if (slot.age > BLOOD_LIFETIME - BLOOD_FADE_DURATION) {
+        const t = Math.max(0, (BLOOD_LIFETIME - slot.age) / BLOOD_FADE_DURATION);
+        slot.material.opacity = 0.85 * t;
+      }
+      if (slot.age >= BLOOD_LIFETIME) {
+        slot.active = false;
+        slot.mesh.visible = false;
+      }
+    }
+  }
+}
