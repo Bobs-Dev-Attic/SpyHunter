@@ -21,6 +21,15 @@ const CORNER_SPEED_SENSITIVITY = 1.35;
 // either side are treated as something to steer around / slow down for.
 const TRAFFIC_FORWARD_RANGE = 9;
 const TRAFFIC_SIDE_RANGE = 2.6;
+// A car ahead that's essentially stopped (stalled, crashed, or just parked
+// after a spin-out) is treated as a fixed obstacle to route around, not
+// traffic to match speed with -- otherwise the old logic would cap the
+// desired speed down toward the stopped car's ~0 and the AI would just queue
+// up behind it forever instead of passing.
+const STOPPED_CAR_SPEED = 1.5;
+const STOPPED_AVOID_STRENGTH = 5.5;
+const MOVING_AVOID_STRENGTH = 3.2;
+const MIN_PASSING_SPEED = 6;
 
 function normalizeAngle(a: number): number {
   while (a > Math.PI) a -= Math.PI * 2;
@@ -97,10 +106,17 @@ export class AIRacer {
       const laneDanger = 1 - Math.abs(sideComp) / safetySide;
       const threat = closeness * laneDanger;
 
-      avoidLateral += (sideComp >= 0 ? -1 : 1) * threat * 3.2;
-      trafficSpeedCap = Math.min(trafficSpeedCap, other.speedKmh / 3.6 + fwdComp * 0.5);
+      const otherSpeed = other.speedKmh / 3.6;
+      const isStopped = otherSpeed < STOPPED_CAR_SPEED;
+
+      avoidLateral += (sideComp >= 0 ? -1 : 1) * threat * (isStopped ? STOPPED_AVOID_STRENGTH : MOVING_AVOID_STRENGTH);
+      trafficSpeedCap = Math.min(
+        trafficSpeedCap,
+        isStopped ? Math.max(MIN_PASSING_SPEED, fwdComp * 0.8) : otherSpeed + fwdComp * 0.5,
+      );
     }
 
+    avoidLateral = THREE.MathUtils.clamp(avoidLateral, -5, 5);
     targetPoint.addScaledVector(car.side, avoidLateral);
 
     const toTarget = targetPoint.sub(car.position);

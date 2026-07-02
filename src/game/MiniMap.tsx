@@ -1,9 +1,12 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { HudState } from "@/game/engine/Engine";
 
-const SIZE = 130;
+const SIZE_PRESETS = { sm: 96, md: 130, lg: 176 } as const;
+type MapSize = keyof typeof SIZE_PRESETS;
+const SIZE_ORDER: MapSize[] = ["sm", "md", "lg"];
+
 const PADDING = 12;
 
 interface Bounds {
@@ -11,7 +14,6 @@ interface Bounds {
   maxX: number;
   minZ: number;
   maxZ: number;
-  scale: number;
 }
 
 function computeBounds(points: [number, number][]): Bounds {
@@ -25,14 +27,14 @@ function computeBounds(points: [number, number][]): Bounds {
     minZ = Math.min(minZ, z);
     maxZ = Math.max(maxZ, z);
   }
-  const span = Math.max(maxX - minX, maxZ - minZ, 1);
-  const scale = (SIZE - PADDING * 2) / span;
-  return { minX, maxX, minZ, maxZ, scale };
+  return { minX, maxX, minZ, maxZ };
 }
 
 export function MiniMap({ hud, trackPoints }: { hud: HudState; trackPoints: [number, number][] }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const boundsRef = useRef<Bounds | null>(null);
+  const [mapSize, setMapSize] = useState<MapSize>("md");
+  const size = SIZE_PRESETS[mapSize];
   const dpr = typeof window !== "undefined" ? Math.min(window.devicePixelRatio || 1, 2) : 1;
 
   useEffect(() => {
@@ -46,19 +48,22 @@ export function MiniMap({ hud, trackPoints }: { hud: HudState; trackPoints: [num
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
+    const span = Math.max(bounds.maxX - bounds.minX, bounds.maxZ - bounds.minZ, 1);
+    const scale = (size - PADDING * 2) / span;
+
     const toCanvas = (x: number, z: number): [number, number] => {
-      const cx = PADDING + (x - bounds.minX) * bounds.scale + ((SIZE - PADDING * 2) - (bounds.maxX - bounds.minX) * bounds.scale) / 2;
-      const cy = PADDING + (z - bounds.minZ) * bounds.scale + ((SIZE - PADDING * 2) - (bounds.maxZ - bounds.minZ) * bounds.scale) / 2;
+      const cx = PADDING + (x - bounds.minX) * scale + ((size - PADDING * 2) - (bounds.maxX - bounds.minX) * scale) / 2;
+      const cy = PADDING + (z - bounds.minZ) * scale + ((size - PADDING * 2) - (bounds.maxZ - bounds.minZ) * scale) / 2;
       return [cx, cy];
     };
 
     ctx.save();
     ctx.scale(dpr, dpr);
-    ctx.clearRect(0, 0, SIZE, SIZE);
+    ctx.clearRect(0, 0, size, size);
 
     ctx.fillStyle = "rgba(20,18,12,0.55)";
     ctx.beginPath();
-    ctx.roundRect(0, 0, SIZE, SIZE, 10);
+    ctx.roundRect(0, 0, size, size, 10);
     ctx.fill();
     ctx.strokeStyle = "rgba(245,239,224,0.35)";
     ctx.lineWidth = 1;
@@ -109,21 +114,51 @@ export function MiniMap({ hud, trackPoints }: { hud: HudState; trackPoints: [num
     ctx.restore();
   });
 
+  const cycleSize = () => {
+    setMapSize((prev) => SIZE_ORDER[(SIZE_ORDER.indexOf(prev) + 1) % SIZE_ORDER.length]);
+  };
+
   return (
-    <canvas
-      ref={canvasRef}
-      width={SIZE * dpr}
-      height={SIZE * dpr}
+    <div
       style={{
         // Top-right, below the speed readout -- bottom corners are reserved
         // for the touch throttle/brake/steer buttons on mobile.
         position: "absolute",
         right: 12,
         top: 100,
-        width: SIZE,
-        height: SIZE,
-        pointerEvents: "none",
+        width: size,
+        height: size,
       }}
-    />
+    >
+      <canvas
+        ref={canvasRef}
+        width={size * dpr}
+        height={size * dpr}
+        style={{ width: size, height: size, pointerEvents: "none" }}
+      />
+      <button
+        onClick={cycleSize}
+        aria-label="Resize minimap"
+        style={{
+          position: "absolute",
+          top: 3,
+          left: 3,
+          width: 16,
+          height: 16,
+          borderRadius: 4,
+          border: "1px solid rgba(245,239,224,0.4)",
+          background: "rgba(10,9,6,0.5)",
+          color: "#f5efe0",
+          fontSize: 9,
+          lineHeight: "14px",
+          fontFamily: '"Courier New", ui-monospace, monospace',
+          cursor: "pointer",
+          pointerEvents: "auto",
+          padding: 0,
+        }}
+      >
+        {mapSize === "sm" ? "S" : mapSize === "md" ? "M" : "L"}
+      </button>
+    </div>
   );
 }
