@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { Engine, type HudState } from "@/game/engine/Engine";
 import { Hud } from "@/game/Hud";
 import { TouchControls } from "@/game/TouchControls";
+import { MiniMap } from "@/game/MiniMap";
 
 const INITIAL_HUD: HudState = {
   currentTime: 0,
@@ -11,6 +12,9 @@ const INITIAL_HUD: HudState = {
   bestLap: null,
   speedKmh: 0,
   offroad: false,
+  carX: 0,
+  carZ: 0,
+  carHeading: 0,
 };
 
 export default function Game() {
@@ -20,6 +24,7 @@ export default function Game() {
   const [hud, setHud] = useState<HudState>(INITIAL_HUD);
   const [isTouch, setIsTouch] = useState(false);
   const [isPortrait, setIsPortrait] = useState(false);
+  const [trackPoints, setTrackPoints] = useState<[number, number][]>([]);
 
   useEffect(() => {
     setIsTouch(window.matchMedia("(pointer: coarse)").matches);
@@ -34,6 +39,7 @@ export default function Game() {
     if (!canvasRef.current || !containerRef.current) return;
     const engine = new Engine(canvasRef.current, containerRef.current);
     engineRef.current = engine;
+    setTrackPoints(engine.getTrackOutline());
     const unsubscribe = engine.onHudUpdate(setHud);
     return () => {
       unsubscribe();
@@ -46,6 +52,7 @@ export default function Game() {
     <div ref={containerRef} style={{ position: "fixed", inset: 0, background: "#1a1710" }}>
       <canvas ref={canvasRef} style={{ display: "block", width: "100%", height: "100%" }} />
       <Hud hud={hud} />
+      {trackPoints.length > 0 && <MiniMap hud={hud} trackPoints={trackPoints} />}
       {isTouch && (
         <TouchControls
           onChange={(throttle, brake, steer, handbrake) =>
