@@ -62,6 +62,7 @@ export default function Game() {
           Rotate your device to landscape to play
         </div>
       )}
+      <div style={versionStyle}>v{process.env.NEXT_PUBLIC_APP_VERSION}</div>
     </div>
   );
 }
@@ -78,6 +79,18 @@ const hintStyle: React.CSSProperties = {
   fontSize: 13,
   pointerEvents: "none",
   textShadow: "0 2px 6px rgba(0,0,0,0.55)",
+};
+
+const versionStyle: React.CSSProperties = {
+  position: "absolute",
+  left: 6,
+  bottom: 4,
+  color: "#f5efe0",
+  opacity: 0.4,
+  fontFamily: '"Courier New", ui-monospace, monospace',
+  fontSize: 10,
+  pointerEvents: "none",
+  textShadow: "0 1px 4px rgba(0,0,0,0.55)",
 };
 
 const rotateOverlayStyle: React.CSSProperties = {
