@@ -36,9 +36,15 @@ export class AIRacer {
   private readonly wobbleFreq = 0.6 + Math.random() * 0.6;
   private readonly lineBias = (Math.random() - 0.5) * 3;
 
-  constructor(track: Track, profile: AIProfile, startPosition: THREE.Vector3, startHeading: number) {
+  constructor(
+    track: Track,
+    profile: AIProfile,
+    startPosition: THREE.Vector3,
+    startHeading: number,
+    carNumber: number,
+  ) {
     this.profile = profile;
-    this.car = new Car(track, profile.colors);
+    this.car = new Car(track, profile.colors, carNumber);
     this.car.position.copy(startPosition);
     this.car.heading = startHeading;
   }

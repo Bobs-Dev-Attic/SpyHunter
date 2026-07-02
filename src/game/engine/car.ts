@@ -27,12 +27,63 @@ const TURN_SPEED_RAMP = 4.5;
 export const CAR_COLLISION_RADIUS = 0.85;
 const COLLISION_RESTITUTION = 1.4;
 
+// Damage model: an impact below DENT_MIN_IMPACT (relative closing speed,
+// m/s) is treated as a shrug-off bump. Above it, cumulative damage (0..1)
+// climbs, body panels near the hit dent inward, and crossing further
+// thresholds detaches parts / catches the car on fire. Nothing repairs --
+// this is arcade wear, not a pit stop.
+const DENT_MIN_IMPACT = 4;
+const DAMAGE_PER_IMPACT_SCALE = 28;
+const MAX_DAMAGE_PER_IMPACT = 0.3;
+const DENT_DEPTH_SCALE = 0.18;
+const MAX_DENT = 0.14;
+const BODY_MIN_HALF_EXTENT = 0.15;
+const FRONT_BUMPER_DETACH_DAMAGE = 0.35;
+const REAR_BUMPER_DETACH_DAMAGE = 0.5;
+const ROOF_DETACH_DAMAGE = 0.65;
+const TIRE_DETACH_DAMAGE = 0.8;
+const FIRE_DAMAGE = 0.75;
+const TIRE_GRIP_PENALTY = 0.18;
+const TIRE_SPEED_PENALTY = 0.12;
+
+export interface DetachEvent {
+  mesh: THREE.Object3D;
+  velocity: THREE.Vector3;
+  angularVelocity: THREE.Vector3;
+}
+
 export interface CarColors {
   body: number;
   stripe: number;
 }
 
 export const DEFAULT_CAR_COLORS: CarColors = { body: 0x2255cc, stripe: 0xf2f2f2 };
+
+function makeNumberPlateTexture(num: number): THREE.CanvasTexture {
+  const size = 128;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d")!;
+
+  ctx.fillStyle = "#f5f2e8";
+  ctx.beginPath();
+  ctx.arc(size / 2, size / 2, size / 2 - 4, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = "#1a1a1a";
+  ctx.lineWidth = 6;
+  ctx.stroke();
+
+  ctx.fillStyle = "#1a1a1a";
+  ctx.font = "bold 56px 'Courier New', monospace";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(String(num % 100).padStart(2, "0"), size / 2, size / 2 + 2);
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
 
 interface SurfaceProfile {
   speedScale: number;
@@ -75,7 +126,7 @@ function buildWheel(): THREE.Group {
   return pivot;
 }
 
-function buildCarMesh(colors: CarColors) {
+function buildCarMesh(colors: CarColors, carNumber: number) {
   const root = new THREE.Group();
 
   const suspension = new THREE.Group();
@@ -130,6 +181,13 @@ function buildCarMesh(colors: CarColors) {
   roofRack.position.set(0, 0.82, -0.1);
   suspension.add(roofRack);
 
+  const plateGeo = new THREE.PlaneGeometry(0.48, 0.48);
+  plateGeo.rotateX(-Math.PI / 2);
+  const plateMat = new THREE.MeshBasicMaterial({ map: makeNumberPlateTexture(carNumber), transparent: true });
+  const numberPlate = new THREE.Mesh(plateGeo, plateMat);
+  numberPlate.position.set(0, 0.855, 0.05);
+  suspension.add(numberPlate);
+
   for (const side of [1, -1]) {
     const headlight = new THREE.Mesh(
       new THREE.BoxGeometry(0.16, 0.12, 0.05),
@@ -172,7 +230,16 @@ function buildCarMesh(colors: CarColors) {
   shadow.position.y = 0.01;
   root.add(shadow);
 
-  return { root, suspension, wheels, exhaustAnchor };
+  return {
+    root,
+    suspension,
+    wheels,
+    exhaustAnchor,
+    bodyGeometry: body.geometry as THREE.BoxGeometry,
+    frontBumper,
+    rearBumper,
+    roofRack,
+  };
 }
 
 export class Car {
@@ -180,6 +247,10 @@ export class Car {
   private readonly suspension: THREE.Group;
   private readonly wheels: THREE.Group[];
   private readonly exhaustAnchor: THREE.Object3D;
+  private readonly bodyGeometry: THREE.BoxGeometry;
+  private frontBumper: THREE.Object3D | null;
+  private rearBumper: THREE.Object3D | null;
+  private roofRack: THREE.Object3D | null;
 
   position = new THREE.Vector3();
   velocity = new THREE.Vector3();
@@ -196,13 +267,30 @@ export class Car {
   isSkidding = false;
   /** Forward acceleration (m/s^2, signed), exposed for camera-feel hooks like braking zoom-in. */
   forwardAccel = 0;
+  /** Body color, exposed so overlays (e.g. the minimap) can tint a car's blip to match. */
+  readonly color: number;
 
-  constructor(track: Track, colors: CarColors = DEFAULT_CAR_COLORS) {
-    const { root, suspension, wheels, exhaustAnchor } = buildCarMesh(colors);
+  /** Cumulative crash damage, 0 (pristine) .. 1 (wrecked). Never repairs. */
+  damage = 0;
+  isOnFire = false;
+  tireLost: [boolean, boolean, boolean, boolean] = [false, false, false, false];
+  private readonly detachedParts = new Set<string>();
+  private pendingDetachments: DetachEvent[] = [];
+
+  constructor(track: Track, colors: CarColors = DEFAULT_CAR_COLORS, carNumber = 1) {
+    this.color = colors.body;
+    const { root, suspension, wheels, exhaustAnchor, bodyGeometry, frontBumper, rearBumper, roofRack } = buildCarMesh(
+      colors,
+      carNumber,
+    );
     this.root = root;
     this.suspension = suspension;
     this.wheels = wheels;
     this.exhaustAnchor = exhaustAnchor;
+    this.bodyGeometry = bodyGeometry;
+    this.frontBumper = frontBumper;
+    this.rearBumper = rearBumper;
+    this.roofRack = roofRack;
 
     this.position.copy(track.startPosition);
     this.heading = track.startHeading;
@@ -264,7 +352,8 @@ export class Car {
     const dragFactor = Math.max(0, 1 - DRAG * dt * (this.isOffroad ? 1.5 : 1));
     forwardSpeed *= dragFactor;
 
-    const maxFwd = MAX_SPEED * speedScale;
+    const tireLossCount = this.tireLost.filter(Boolean).length;
+    const maxFwd = MAX_SPEED * speedScale * (1 - tireLossCount * TIRE_SPEED_PENALTY);
     forwardSpeed = THREE.MathUtils.clamp(forwardSpeed, -MAX_REVERSE_SPEED, maxFwd);
 
     // Turn authority ramps up with actual rolling speed and is ~0 at a
@@ -278,7 +367,7 @@ export class Car {
     const turnRate = -input.steer * MAX_TURN_RATE * speedForTurn * reverseSign;
     this.heading += turnRate * dt;
 
-    const grip = input.handbrake ? GRIP_DRIFT : surface.grip;
+    const grip = (input.handbrake ? GRIP_DRIFT : surface.grip) * (1 - tireLossCount * TIRE_GRIP_PENALTY);
     const slipMagnitude = Math.abs(lateralSpeed);
     lateralSpeed *= Math.max(0, 1 - grip * dt);
 
@@ -313,6 +402,7 @@ export class Car {
     this.suspension.position.y = WHEEL_RADIUS - bob;
 
     for (const wheel of this.wheels) {
+      if (!wheel.parent) continue;
       if (wheel.userData.steerable) {
         wheel.rotation.y = this.visualSteer;
       }
@@ -345,6 +435,7 @@ export class Car {
         this.velocity.x -= vDotN * nx * COLLISION_RESTITUTION;
         this.velocity.z -= vDotN * nz * COLLISION_RESTITUTION;
         this.impactPulse = Math.min(1, this.impactPulse + Math.abs(vDotN) / 14);
+        this.applyDamage(Math.abs(vDotN), new THREE.Vector3(-nx, 0, -nz));
         hit = true;
       }
     }
@@ -387,11 +478,148 @@ export class Car {
       other.velocity.z += impulse * nz;
       this.impactPulse = Math.min(1, this.impactPulse + Math.abs(vDotN) / 14);
       other.impactPulse = Math.min(1, other.impactPulse + Math.abs(vDotN) / 14);
+      this.applyDamage(Math.abs(vDotN), new THREE.Vector3(-nx, 0, -nz));
+      other.applyDamage(Math.abs(vDotN), new THREE.Vector3(nx, 0, nz));
     }
 
     this.syncTransform();
     other.syncTransform();
     return true;
+  }
+
+  /** Drains and returns any parts that detached this frame, for the caller to hand off to a debris system. */
+  drainDetachments(): DetachEvent[] {
+    if (this.pendingDetachments.length === 0) return [];
+    const events = this.pendingDetachments;
+    this.pendingDetachments = [];
+    return events;
+  }
+
+  /**
+   * Registers a crash impact: accumulates damage, crumples the body mesh
+   * near the hit side, and past thresholds detaches bumpers/roof/a wheel or
+   * sets the car on fire. worldImpactDir points from the car's center
+   * toward the side that got hit (world space, Y ignored).
+   */
+  private applyDamage(impactSpeed: number, worldImpactDir: THREE.Vector3) {
+    if (impactSpeed < DENT_MIN_IMPACT || this.damage >= 1) return;
+
+    const delta = Math.min(MAX_DAMAGE_PER_IMPACT, impactSpeed / DAMAGE_PER_IMPACT_SCALE);
+    this.damage = Math.min(1, this.damage + delta);
+
+    const cosT = Math.cos(this.heading);
+    const sinT = Math.sin(this.heading);
+    // World -> local (inverse of the root's heading rotation).
+    const localNormal = new THREE.Vector3(
+      worldImpactDir.x * cosT - worldImpactDir.z * sinT,
+      0,
+      worldImpactDir.x * sinT + worldImpactDir.z * cosT,
+    );
+
+    this.dentAxis(localNormal, delta);
+
+    const isFrontHit = localNormal.z > 0.3;
+    const isRearHit = localNormal.z < -0.3;
+
+    if (this.frontBumper && isFrontHit && this.damage > FRONT_BUMPER_DETACH_DAMAGE && !this.detachedParts.has("front")) {
+      this.detachPart(this.frontBumper, "front", localNormal);
+      this.frontBumper = null;
+    }
+    if (this.rearBumper && isRearHit && this.damage > REAR_BUMPER_DETACH_DAMAGE && !this.detachedParts.has("rear")) {
+      this.detachPart(this.rearBumper, "rear", localNormal);
+      this.rearBumper = null;
+    }
+    if (this.roofRack && this.damage > ROOF_DETACH_DAMAGE && !this.detachedParts.has("roof")) {
+      this.detachPart(this.roofRack, "roof", localNormal);
+      this.roofRack = null;
+    }
+    if (this.damage > TIRE_DETACH_DAMAGE && !this.detachedParts.has("tire")) {
+      const idx = isFrontHit || isRearHit ? (isFrontHit ? (localNormal.x >= 0 ? 0 : 1) : localNormal.x >= 0 ? 2 : 3) : 2;
+      this.detachWheel(idx, localNormal);
+      this.detachedParts.add("tire");
+    }
+    if (this.damage > FIRE_DAMAGE) this.isOnFire = true;
+  }
+
+  /** Crumples the body box's vertices on the hit face inward, so repeated crashes visibly mangle the car. */
+  private dentAxis(localNormal: THREE.Vector3, strength: number) {
+    const pos = this.bodyGeometry.attributes.position as THREE.BufferAttribute;
+    const useX = Math.abs(localNormal.x) > Math.abs(localNormal.z);
+    const dir = useX ? Math.sign(localNormal.x || 1) : Math.sign(localNormal.z || 1);
+    const push = -dir * Math.min(MAX_DENT, strength * DENT_DEPTH_SCALE);
+
+    for (let i = 0; i < pos.count; i++) {
+      const v = useX ? pos.getX(i) : pos.getZ(i);
+      if (Math.sign(v || 1) !== dir) continue;
+      const next = v + push;
+      const clamped = dir > 0 ? Math.max(next, BODY_MIN_HALF_EXTENT) : Math.min(next, -BODY_MIN_HALF_EXTENT);
+      if (useX) pos.setX(i, clamped);
+      else pos.setZ(i, clamped);
+    }
+    pos.needsUpdate = true;
+    this.bodyGeometry.computeVertexNormals();
+  }
+
+  /** Detaches a body part (bumper/roof rack) into world space with an outward+upward velocity, queued for debris. */
+  private detachPart(mesh: THREE.Object3D, tag: string, localNormal: THREE.Vector3) {
+    this.detachedParts.add(tag);
+
+    const worldPos = new THREE.Vector3();
+    mesh.getWorldPosition(worldPos);
+    const worldQuat = new THREE.Quaternion();
+    mesh.getWorldQuaternion(worldQuat);
+    mesh.parent?.remove(mesh);
+    mesh.position.copy(worldPos);
+    mesh.quaternion.copy(worldQuat);
+
+    const cosT = Math.cos(this.heading);
+    const sinT = Math.sin(this.heading);
+    // Local -> world.
+    const worldDirX = localNormal.x * cosT + localNormal.z * sinT;
+    const worldDirZ = -localNormal.x * sinT + localNormal.z * cosT;
+
+    const velocity = this.velocity.clone();
+    velocity.x += worldDirX * (2.5 + Math.random() * 2.5);
+    velocity.z += worldDirZ * (2.5 + Math.random() * 2.5);
+    velocity.y = 2.5 + Math.random() * 2;
+
+    const angularVelocity = new THREE.Vector3(
+      (Math.random() - 0.5) * 10,
+      (Math.random() - 0.5) * 10,
+      (Math.random() - 0.5) * 10,
+    );
+    this.pendingDetachments.push({ mesh, velocity, angularVelocity });
+  }
+
+  private detachWheel(index: number, localNormal: THREE.Vector3) {
+    const wheel = this.wheels[index];
+    if (!wheel.parent) return;
+    this.tireLost[index] = true;
+
+    const worldPos = new THREE.Vector3();
+    wheel.getWorldPosition(worldPos);
+    const worldQuat = new THREE.Quaternion();
+    wheel.getWorldQuaternion(worldQuat);
+    wheel.parent?.remove(wheel);
+    wheel.position.copy(worldPos);
+    wheel.quaternion.copy(worldQuat);
+
+    const cosT = Math.cos(this.heading);
+    const sinT = Math.sin(this.heading);
+    const worldDirX = localNormal.x * cosT + localNormal.z * sinT;
+    const worldDirZ = -localNormal.x * sinT + localNormal.z * cosT;
+
+    const velocity = this.velocity.clone();
+    velocity.x += worldDirX * (2 + Math.random() * 2) + (Math.random() - 0.5) * 3;
+    velocity.z += worldDirZ * (2 + Math.random() * 2) + (Math.random() - 0.5) * 3;
+    velocity.y = 3 + Math.random() * 2;
+
+    const angularVelocity = new THREE.Vector3(
+      (Math.random() - 0.5) * 14,
+      (Math.random() - 0.5) * 14,
+      (Math.random() - 0.5) * 14,
+    );
+    this.pendingDetachments.push({ mesh: wheel, velocity, angularVelocity });
   }
 
   private syncTransform() {

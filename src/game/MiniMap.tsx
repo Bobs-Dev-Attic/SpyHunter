@@ -78,6 +78,17 @@ export function MiniMap({ hud, trackPoints }: { hud: HudState; trackPoints: [num
       ctx.stroke();
     }
 
+    for (const racer of hud.racers) {
+      const [rx, ry] = toCanvas(racer.x, racer.z);
+      ctx.beginPath();
+      ctx.arc(rx, ry, 2.6, 0, Math.PI * 2);
+      ctx.fillStyle = `#${racer.color.toString(16).padStart(6, "0")}`;
+      ctx.fill();
+      ctx.strokeStyle = "rgba(0,0,0,0.4)";
+      ctx.lineWidth = 0.6;
+      ctx.stroke();
+    }
+
     const [carX, carY] = toCanvas(hud.carX, hud.carZ);
     const fx = Math.sin(hud.carHeading);
     const fz = Math.cos(hud.carHeading);

@@ -6,6 +6,8 @@ import { InputController } from "./input";
 import { SkidMarks, SmokeEmitter } from "./effects";
 import { BirdFlock, Lizard } from "./wildlife";
 import { AI_PROFILES, AIRacer, buildStartingGrid } from "./aiRacer";
+import { DebrisSystem } from "./debris";
+import { Bystander, placeBystanders } from "./bystanders";
 
 const BASE_VIEW_HEIGHT = 20;
 const MIN_VIEW_HEIGHT = 14;
@@ -19,6 +21,12 @@ const MAX_DECEL_ZOOM_PULL = 6;
 const CAMERA_OFFSET = new THREE.Vector3(24, 30, 24);
 const MIN_LAP_TIME = 4;
 
+export interface RacerBlip {
+  x: number;
+  z: number;
+  color: number;
+}
+
 export interface HudState {
   currentTime: number;
   lastLap: number | null;
@@ -28,6 +36,7 @@ export interface HudState {
   carX: number;
   carZ: number;
   carHeading: number;
+  racers: RacerBlip[];
 }
 
 export class Engine {
@@ -48,6 +57,11 @@ export class Engine {
   private birdFlocks: BirdFlock[] = [];
   private racers: AIRacer[] = [];
   private readonly allCars: Car[] = [];
+  private debris: DebrisSystem;
+  private bystanders: Bystander[] = [];
+  private fireEmitter: SmokeEmitter;
+  private fireSmoke: SmokeEmitter;
+  private readonly firePos = new THREE.Vector3();
 
   private raf = 0;
   private lastTime = 0;
@@ -83,12 +97,12 @@ export class Engine {
     // above); we just keep references here to drive their per-frame update.
     this.lizards = environment.lizards;
 
-    this.car = new Car(this.track);
+    this.car = new Car(this.track, undefined, 1);
     this.scene.add(this.car.root);
 
     const grid = buildStartingGrid(this.track, AI_PROFILES.length);
     this.racers = AI_PROFILES.map(
-      (profile, i) => new AIRacer(this.track, profile, grid[i].position, grid[i].heading),
+      (profile, i) => new AIRacer(this.track, profile, grid[i].position, grid[i].heading, i + 2),
     );
     for (const racer of this.racers) this.scene.add(racer.car.root);
     this.allCars = [this.car, ...this.racers.map((r) => r.car)];
@@ -119,6 +133,38 @@ export class Engine {
       rise: 0.9,
     });
     this.scene.add(this.exhaust.points);
+
+    this.fireEmitter = new SmokeEmitter({
+      maxParticles: 150,
+      color: 0xff6a1a,
+      baseSize: [10, 18],
+      growth: 1.6,
+      opacity: [0.55, 0.8],
+      lifetime: [0.25, 0.4],
+      drag: 0.5,
+      rise: 2.2,
+      baseHeight: [0.25, 0.55],
+    });
+    this.scene.add(this.fireEmitter.points);
+
+    this.fireSmoke = new SmokeEmitter({
+      maxParticles: 180,
+      color: 0x2a2622,
+      baseSize: [14, 24],
+      growth: 3.2,
+      opacity: [0.35, 0.55],
+      lifetime: [1.2, 1.8],
+      drag: 0.4,
+      rise: 1.1,
+      baseHeight: [0.4, 0.7],
+    });
+    this.scene.add(this.fireSmoke.points);
+
+    this.debris = new DebrisSystem();
+    this.scene.add(this.debris.group);
+
+    this.bystanders = placeBystanders(this.track);
+    for (const bystander of this.bystanders) this.scene.add(bystander.group);
 
     this.skidMarks = new SkidMarks();
     this.scene.add(this.skidMarks.mesh);
@@ -249,6 +295,27 @@ export class Engine {
       }
     }
 
+    for (const car of this.allCars) {
+      for (const ev of car.drainDetachments()) {
+        this.debris.spawn(ev.mesh, ev.velocity, ev.angularVelocity);
+      }
+    }
+    this.debris.update(dt);
+
+    for (const bystander of this.bystanders) bystander.update(dt, this.allCars);
+    for (const car of this.allCars) {
+      for (const bystander of this.bystanders) bystander.tryHit(car);
+    }
+
+    for (const car of this.allCars) {
+      if (!car.isOnFire) continue;
+      this.firePos.set(car.position.x, car.position.y, car.position.z);
+      this.fireEmitter.spawn(this.firePos, 3, 0.5);
+      this.fireSmoke.spawn(this.firePos, 2, 0.6);
+    }
+    this.fireEmitter.update(dt);
+    this.fireSmoke.update(dt);
+
     const speedKmh = this.car.speedKmh;
     const backward = this.backwardBias.copy(this.car.forward).negate();
     if ((this.car.isSkidding || this.car.isOffroad) && speedKmh > 8) {
@@ -292,6 +359,7 @@ export class Engine {
         carX: this.car.position.x,
         carZ: this.car.position.z,
         carHeading: this.car.heading,
+        racers: this.racers.map((r) => ({ x: r.car.position.x, z: r.car.position.z, color: r.car.color })),
       });
     }
 
