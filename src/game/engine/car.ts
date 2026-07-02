@@ -12,7 +12,13 @@ const BRAKE_DECEL = 26;
 const DRAG = 0.22;
 const MAX_SPEED = 27;
 const MAX_REVERSE_SPEED = 10;
-const MAX_TURN_RATE = 2.9;
+// Lowered from the original 2.9, and steer input is now smoothed (see
+// smoothedSteer in update()) rather than applied instantly -- pressing a
+// steer key ramps the turn rate up over a few frames like a real steering
+// rack instead of snapping straight to full lock, and holding it doesn't
+// swing the car as sharply per press.
+const MAX_TURN_RATE = 2.1;
+const STEER_SMOOTH_POW = 0.003;
 // How quickly tires "catch" the heading change (lateral slip damping).
 const GRIP_ROAD = 5.5;
 const GRIP_CURB = 4.0;
@@ -43,18 +49,18 @@ const REAR_BUMPER_DETACH_DAMAGE = 0.5;
 const ROOF_DETACH_DAMAGE = 0.65;
 const TIRE_DETACH_DAMAGE = 0.8;
 const FIRE_DAMAGE = 0.75;
-const TIRE_GRIP_PENALTY = 0.18;
-const TIRE_SPEED_PENALTY = 0.12;
+const TIRE_GRIP_PENALTY = 0.26;
+const TIRE_SPEED_PENALTY = 0.18;
 // A missing front wheel drags on its rim, both fighting the steering and
 // constantly pulling the nose toward that side. A missing rear wheel instead
 // lets the back end step out much more readily (fishtail/oversteer) without
 // directly fighting the driver's input.
-const FRONT_TIRE_STEER_LOSS = 0.32;
-const FRONT_TIRE_HEADING_PULL = 0.4;
-const REAR_TIRE_GRIP_PENALTY = 0.32;
-const MIN_STEER_AUTHORITY = 0.35;
-const TIRE_LEAN_ROLL = 0.05;
-const TIRE_LEAN_PITCH = 0.035;
+const FRONT_TIRE_STEER_LOSS = 0.5;
+const FRONT_TIRE_HEADING_PULL = 0.75;
+const REAR_TIRE_GRIP_PENALTY = 0.5;
+const MIN_STEER_AUTHORITY = 0.2;
+const TIRE_LEAN_ROLL = 0.09;
+const TIRE_LEAN_PITCH = 0.06;
 // Local (x, z) offsets matching the wheelOffsets used to build the car mesh,
 // used to figure out which side/end a lost wheel was on.
 const WHEEL_LOCAL_XZ: readonly [number, number][] = [
@@ -88,6 +94,14 @@ export interface DetachEvent {
   mesh: THREE.Object3D;
   velocity: THREE.Vector3;
   angularVelocity: THREE.Vector3;
+}
+
+/** Reports a hard hit against a specific static collider (tree/rock/cactus), for the caller to react (e.g. topple a tree). */
+export interface ColliderHitEvent {
+  id: number;
+  impactSpeed: number;
+  /** World-space direction from the car toward the obstacle. */
+  impactDir: THREE.Vector3;
 }
 
 export interface CarColors {
@@ -288,6 +302,7 @@ export class Car {
   forward = new THREE.Vector3(0, 0, 1);
   side = new THREE.Vector3(1, 0, 0);
   private visualSteer = 0;
+  private smoothedSteer = 0;
   private prevForwardSpeed = 0;
   private impactPulse = 0;
 
@@ -305,6 +320,7 @@ export class Car {
   tireLost: [boolean, boolean, boolean, boolean] = [false, false, false, false];
   private readonly detachedParts = new Set<string>();
   private pendingDetachments: DetachEvent[] = [];
+  private pendingColliderHits: ColliderHitEvent[] = [];
 
   /** Instrument-panel telemetry, purely cosmetic (doesn't feed back into drive physics except at empty fuel). */
   rpm = IDLE_RPM;
@@ -428,7 +444,11 @@ export class Car {
     // heading to actually turn the car right.
     const speedForTurn = 1 - Math.exp(-Math.abs(forwardSpeed) / TURN_SPEED_RAMP);
     const reverseSign = forwardSpeed < 0 ? -1 : 1;
-    const turnRate = -input.steer * MAX_TURN_RATE * speedForTurn * reverseSign * steerAuthority;
+    // The steering rack doesn't snap to full lock the instant a key is
+    // pressed -- smooth the raw -1/0/1 input before it drives the turn rate,
+    // so tapping a direction turns the car noticeably less than holding it.
+    this.smoothedSteer = THREE.MathUtils.lerp(this.smoothedSteer, input.steer, 1 - Math.pow(STEER_SMOOTH_POW, dt));
+    const turnRate = -this.smoothedSteer * MAX_TURN_RATE * speedForTurn * reverseSign * steerAuthority;
     this.heading += (turnRate + headingPull * speedForTurn) * dt;
 
     const gripPenalty = Math.min(0.85, tireLossCount * TIRE_GRIP_PENALTY + rearGripPenalty);
@@ -534,11 +554,35 @@ export class Car {
         this.velocity.z -= vDotN * nz * COLLISION_RESTITUTION;
         this.impactPulse = Math.min(1, this.impactPulse + Math.abs(vDotN) / 14);
         this.applyDamage(Math.abs(vDotN), new THREE.Vector3(-nx, 0, -nz));
+        this.pendingColliderHits.push({
+          id: c.id,
+          impactSpeed: Math.abs(vDotN),
+          impactDir: new THREE.Vector3(nx, 0, nz),
+        });
         hit = true;
       }
     }
     if (hit) this.syncTransform();
     return hit;
+  }
+
+  /** Drains and returns any static-collider hits registered this frame (e.g. for toppling scenery). */
+  drainColliderHits(): ColliderHitEvent[] {
+    if (this.pendingColliderHits.length === 0) return [];
+    const hits = this.pendingColliderHits;
+    this.pendingColliderHits = [];
+    return hits;
+  }
+
+  /**
+   * Public entry point for damage sources outside the built-in collision
+   * resolvers (e.g. clipping a bystander in Engine). severityScale softens
+   * how much damage the impact leaves -- a person is a lot softer than a
+   * rock or tree -- without changing the minimum speed needed to register
+   * as damage at all.
+   */
+  registerCollisionDamage(impactSpeed: number, worldImpactDir: THREE.Vector3, severityScale = 1) {
+    this.applyDamage(impactSpeed, worldImpactDir, severityScale);
   }
 
   /**
@@ -599,10 +643,10 @@ export class Car {
    * sets the car on fire. worldImpactDir points from the car's center
    * toward the side that got hit (world space, Y ignored).
    */
-  private applyDamage(impactSpeed: number, worldImpactDir: THREE.Vector3) {
+  private applyDamage(impactSpeed: number, worldImpactDir: THREE.Vector3, severityScale = 1) {
     if (impactSpeed < DENT_MIN_IMPACT || this.damage >= 1) return;
 
-    const delta = Math.min(MAX_DAMAGE_PER_IMPACT, impactSpeed / DAMAGE_PER_IMPACT_SCALE);
+    const delta = Math.min(MAX_DAMAGE_PER_IMPACT, impactSpeed / DAMAGE_PER_IMPACT_SCALE) * severityScale;
     this.damage = Math.min(1, this.damage + delta);
 
     const cosT = Math.cos(this.heading);

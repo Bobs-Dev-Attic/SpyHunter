@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import { ROAD_WIDTH, Track } from "./track";
-import { buildEnvironment, type Collider } from "./environment";
+import { buildEnvironment, Decoration, type Collider } from "./environment";
 import { Car } from "./car";
 import { InputController } from "./input";
 import { BloodDecals, SkidMarks, SmokeEmitter } from "./effects";
@@ -60,6 +60,8 @@ export class Engine {
   private skidMarks: SkidMarks;
   private colliders: Collider[];
   private lizards: Lizard[];
+  private decorations: Decoration[];
+  private decorationsById: Map<number, Decoration>;
   private birdFlocks: BirdFlock[] = [];
   private racers: AIRacer[] = [];
   private readonly allCars: Car[] = [];
@@ -103,6 +105,8 @@ export class Engine {
     // Lizard meshes are already parented under environment.group (added
     // above); we just keep references here to drive their per-frame update.
     this.lizards = environment.lizards;
+    this.decorations = environment.decorations;
+    this.decorationsById = new Map(this.decorations.map((d) => [d.collider.id, d]));
 
     this.car = new Car(this.track, undefined, 1);
     this.scene.add(this.car.root);
@@ -309,12 +313,33 @@ export class Engine {
       for (const ev of car.drainDetachments()) {
         this.debris.spawn(ev.mesh, ev.velocity, ev.angularVelocity);
       }
+      for (const hitEv of car.drainColliderHits()) {
+        const decoration = this.decorationsById.get(hitEv.id);
+        const armEvent = decoration?.registerHit(hitEv.impactSpeed, hitEv.impactDir);
+        if (armEvent) this.debris.spawn(armEvent.mesh, armEvent.velocity, armEvent.angularVelocity);
+      }
     }
     this.debris.update(dt);
 
+    for (const decoration of this.decorations) {
+      decoration.update(dt);
+      if (decoration.fallen && !decoration.colliderRemoved) {
+        decoration.colliderRemoved = true;
+        const idx = this.colliders.indexOf(decoration.collider);
+        if (idx !== -1) this.colliders.splice(idx, 1);
+      }
+    }
+
     for (const bystander of this.bystanders) bystander.update(dt, this.allCars);
     for (const car of this.allCars) {
-      for (const bystander of this.bystanders) bystander.tryHit(car);
+      for (const bystander of this.bystanders) {
+        if (bystander.tryHit(car)) {
+          // A person is soft -- clipping one dings the car far less than
+          // hitting a tree or rock at the same speed.
+          const impactDir = car.velocity.lengthSq() > 0.01 ? car.velocity.clone().normalize() : car.forward.clone();
+          car.registerCollisionDamage(car.velocity.length(), impactDir, 0.25);
+        }
+      }
     }
     for (const bystander of this.bystanders) {
       for (const point of bystander.drainBlood()) this.blood.spawn(point);
