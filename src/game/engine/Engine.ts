@@ -3,7 +3,7 @@ import { ROAD_WIDTH, Track } from "./track";
 import { buildEnvironment, type Collider } from "./environment";
 import { Car } from "./car";
 import { InputController } from "./input";
-import { SkidMarks, SmokeEmitter } from "./effects";
+import { BloodDecals, SkidMarks, SmokeEmitter } from "./effects";
 import { BirdFlock, Lizard } from "./wildlife";
 import { AI_PROFILES, AIRacer, buildStartingGrid } from "./aiRacer";
 import { DebrisSystem } from "./debris";
@@ -62,6 +62,7 @@ export class Engine {
   private fireEmitter: SmokeEmitter;
   private fireSmoke: SmokeEmitter;
   private readonly firePos = new THREE.Vector3();
+  private blood: BloodDecals;
 
   private raf = 0;
   private lastTime = 0;
@@ -165,6 +166,9 @@ export class Engine {
 
     this.bystanders = placeBystanders(this.track);
     for (const bystander of this.bystanders) this.scene.add(bystander.group);
+
+    this.blood = new BloodDecals();
+    this.scene.add(this.blood.group);
 
     this.skidMarks = new SkidMarks();
     this.scene.add(this.skidMarks.mesh);
@@ -306,6 +310,10 @@ export class Engine {
     for (const car of this.allCars) {
       for (const bystander of this.bystanders) bystander.tryHit(car);
     }
+    for (const bystander of this.bystanders) {
+      for (const point of bystander.drainBlood()) this.blood.spawn(point);
+    }
+    this.blood.update(dt);
 
     for (const car of this.allCars) {
       if (!car.isOnFire) continue;

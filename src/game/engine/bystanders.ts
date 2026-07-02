@@ -10,6 +10,19 @@ const HIT_RADIUS = 0.42;
 const RAGDOLL_DURATION = 3.2;
 const UP = new THREE.Vector3(0, 1, 0);
 
+// Injury is determined by how fast the car was going at the moment of
+// impact: a slow bump just knocks someone down (they hop back up), but a
+// hard hit leaves them too hurt to stand right away -- they crawl toward
+// safety instead, dragging themselves by the arms, before recovering.
+const MINOR_INJURY_SPEED = 6;
+const MAJOR_INJURY_SPEED = 14;
+const CRAWL_SPEED_MINOR = 0.85;
+const CRAWL_SPEED_MAJOR = 0.4;
+const CRAWL_DURATION_MINOR = 2.5;
+const CRAWL_DURATION_MAJOR = 5.5;
+
+type Injury = "none" | "minor" | "major";
+
 const SHIRT_COLORS = [0xd8432b, 0x2b6fd8, 0xe8b923, 0x3f9e52, 0xd84bb0, 0xf2f2f2, 0x2b2b2e, 0xe8722c];
 const SKIN_COLORS = [0xe8b98a, 0xc98a5a, 0x8a5a3a, 0xf2d9b8];
 const PANTS_COLORS = [0x2b3a4a, 0x4a3a2b, 0x3a3a3a];
@@ -73,7 +86,7 @@ function buildBystanderMesh(): BystanderMesh {
   return { group, armL, armR, legL, legR };
 }
 
-type BystanderState = "idle" | "dodging" | "ragdoll" | "recovering";
+type BystanderState = "idle" | "dodging" | "ragdoll" | "crawling" | "recovering";
 
 /**
  * A trackside spectator. Idles with a cheering bob/wave, scrambles out of
@@ -90,12 +103,18 @@ export class Bystander {
   private readonly home: THREE.Vector3;
   private readonly homeHeading: number;
   private readonly baseY: number;
+  private readonly awayDir: THREE.Vector3;
 
   private state: BystanderState = "idle";
   private phase = Math.random() * Math.PI * 2;
   private readonly dodgeTarget = new THREE.Vector3();
   private readonly rag: RigidBodyState = { velocity: new THREE.Vector3(), angularVelocity: new THREE.Vector3() };
   private ragTimer = 0;
+  private injury: Injury = "none";
+  private crawlTimer = 0;
+  private crawlDuration = 0;
+  private readonly crawlDir = new THREE.Vector3();
+  private pendingBlood: THREE.Vector3[] = [];
 
   constructor(position: THREE.Vector3, outward: THREE.Vector3) {
     const { group, armL, armR, legL, legR } = buildBystanderMesh();
@@ -107,6 +126,7 @@ export class Bystander {
     this.group.position.copy(position);
     this.home = position.clone();
     this.baseY = position.y;
+    this.awayDir = outward.clone().normalize();
     this.homeHeading = Math.atan2(-outward.x, -outward.z);
     this.group.rotation.y = this.homeHeading;
   }
@@ -142,10 +162,18 @@ export class Bystander {
   }
 
   private resetPose() {
-    this.armL.rotation.z = 0;
-    this.armR.rotation.z = 0;
+    this.armL.rotation.set(0, 0, 0);
+    this.armR.rotation.set(0, 0, 0);
     this.legL.rotation.x = 0;
     this.legR.rotation.x = 0;
+  }
+
+  /** Tips the standing figure onto its front, facing crawlDir, for the crawling state. */
+  private setPronePose() {
+    const yaw = Math.atan2(this.crawlDir.x, this.crawlDir.z);
+    const euler = new THREE.Euler(-Math.PI / 2, yaw, 0, "YXZ");
+    this.group.quaternion.setFromEuler(euler);
+    this.group.position.y = this.baseY + 0.05;
   }
 
   update(dt: number, cars: Car[]) {
@@ -185,7 +213,41 @@ export class Bystander {
       case "ragdoll": {
         stepRigidBody(this.group, this.rag, dt, this.baseY);
         this.ragTimer += dt;
-        if (this.ragTimer > RAGDOLL_DURATION) this.state = "recovering";
+        if (this.ragTimer > RAGDOLL_DURATION) {
+          if (this.injury === "none") {
+            this.state = "recovering";
+            this.resetPose();
+          } else {
+            this.state = "crawling";
+            this.crawlTimer = 0;
+            this.crawlDuration = this.injury === "major" ? CRAWL_DURATION_MAJOR : CRAWL_DURATION_MINOR;
+            // Drag themselves further from the road, in whatever direction
+            // they ended up facing after the tumble.
+            this.crawlDir.copy(this.awayDir);
+            const facing = new THREE.Vector3(Math.sin(this.group.rotation.y), 0, Math.cos(this.group.rotation.y));
+            if (facing.dot(this.awayDir) < 0) this.crawlDir.negate();
+            this.setPronePose();
+          }
+        }
+        break;
+      }
+      case "crawling": {
+        this.crawlTimer += dt;
+        const speed = this.injury === "major" ? CRAWL_SPEED_MAJOR : CRAWL_SPEED_MINOR;
+        this.group.position.addScaledVector(this.crawlDir, speed * dt);
+
+        // Arms reach forward and pull, like dragging yourself along the ground.
+        this.phase += dt * 3.2;
+        const pull = (Math.sin(this.phase) + 1) * 0.5;
+        this.armL.rotation.x = -0.6 - pull * 0.7;
+        this.armR.rotation.x = -0.6 - Math.sin(this.phase + Math.PI) * 0.5 - 0.5;
+        this.legL.rotation.x = Math.sin(this.phase) * 0.3;
+        this.legR.rotation.x = -Math.sin(this.phase) * 0.3;
+
+        if (this.crawlTimer > this.crawlDuration) {
+          this.state = "recovering";
+          this.resetPose();
+        }
         break;
       }
       case "recovering": {
@@ -203,13 +265,16 @@ export class Bystander {
     }
   }
 
-  /** Called per car per frame; knocks the bystander down if actually clipped. Returns true if a hit occurred. */
+  /** Called per car per frame (any car -- player or AI, so a hit can happen by accident either way). Knocks the bystander down if actually clipped. Returns true if a hit occurred. */
   tryHit(car: Car): boolean {
-    if (this.state === "ragdoll" || this.state === "recovering") return false;
+    if (this.state === "ragdoll" || this.state === "recovering" || this.state === "crawling") return false;
     const dx = this.group.position.x - car.position.x;
     const dz = this.group.position.z - car.position.z;
     const dist = Math.sqrt(dx * dx + dz * dz);
     if (dist > HIT_RADIUS + CAR_COLLISION_RADIUS) return false;
+
+    const impactSpeed = car.velocity.length();
+    this.injury = impactSpeed > MAJOR_INJURY_SPEED ? "major" : impactSpeed > MINOR_INJURY_SPEED ? "minor" : "none";
 
     this.state = "ragdoll";
     this.ragTimer = 0;
@@ -217,7 +282,24 @@ export class Bystander {
     this.rag.velocity.copy(car.velocity).multiplyScalar(0.7);
     this.rag.velocity.y = 3 + Math.random() * 2;
     this.rag.angularVelocity.set((Math.random() - 0.5) * 10, (Math.random() - 0.5) * 6, (Math.random() - 0.5) * 10);
+
+    if (this.injury !== "none") {
+      const splats = this.injury === "major" ? 3 : 1;
+      for (let i = 0; i < splats; i++) {
+        this.pendingBlood.push(
+          this.group.position.clone().add(new THREE.Vector3((Math.random() - 0.5) * 0.7, 0, (Math.random() - 0.5) * 0.7)),
+        );
+      }
+    }
     return true;
+  }
+
+  /** Drains and returns any ground-blood spawn points queued this frame. */
+  drainBlood(): THREE.Vector3[] {
+    if (this.pendingBlood.length === 0) return [];
+    const points = this.pendingBlood;
+    this.pendingBlood = [];
+    return points;
   }
 }
 
