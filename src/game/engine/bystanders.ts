@@ -153,12 +153,24 @@ export class Bystander {
   /** Bobbing/waving idle cheer, or -- with `running` -- a leg-pumping scramble. */
   private cheerPose(rate: number, running: boolean) {
     this.phase += rate;
-    const legSwing = running ? 0.85 : 0.3;
     this.group.position.y = this.baseY + Math.max(0, Math.sin(this.phase)) * 0.12;
     this.armL.rotation.z = Math.sin(this.phase) * 0.9;
     this.armR.rotation.z = -Math.sin(this.phase + 0.6) * 0.9;
-    this.legL.rotation.x = Math.sin(this.phase) * legSwing;
-    this.legR.rotation.x = -Math.sin(this.phase) * legSwing;
+
+    if (running) {
+      // Actually going somewhere (fleeing a car) -- alternating gait.
+      const legSwing = 0.85;
+      this.legL.rotation.x = Math.sin(this.phase) * legSwing;
+      this.legR.rotation.x = -Math.sin(this.phase) * legSwing;
+    } else {
+      // Standing still and cheering -- a synchronized little knee bend on
+      // the bounce reads as excitement. An alternating gait here looked
+      // like a walk cycle stuck in place, since idle bystanders never
+      // actually move.
+      const kneeBend = Math.max(0, Math.sin(this.phase)) * 0.18;
+      this.legL.rotation.x = kneeBend;
+      this.legR.rotation.x = kneeBend;
+    }
   }
 
   private resetPose() {
