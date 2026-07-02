@@ -33,6 +33,8 @@ export interface SmokeOptions {
   drag?: number;
   /** Upward acceleration, world units/s^2 (buoyancy). */
   rise?: number;
+  /** Spawn height above the given spawn position, randomized within this range. Defaults to ground-hugging. */
+  baseHeight?: [number, number];
 }
 
 /**
@@ -123,11 +125,12 @@ export class SmokeEmitter {
     const [opMin, opMax] = this.opts.opacity;
     const [lifeMin, lifeMax] = this.opts.lifetime;
 
+    const [heightMin, heightMax] = this.opts.baseHeight ?? [0.15, 0.3];
     for (let n = 0; n < count; n++) {
       const i = this.cursor;
       this.cursor = (this.cursor + 1) % this.max;
       this.positions[i * 3 + 0] = pos.x + (Math.random() - 0.5) * spread;
-      this.positions[i * 3 + 1] = 0.15 + Math.random() * 0.15;
+      this.positions[i * 3 + 1] = pos.y + heightMin + Math.random() * (heightMax - heightMin);
       this.positions[i * 3 + 2] = pos.z + (Math.random() - 0.5) * spread;
 
       const bx = forwardBias ? forwardBias.x * 0.8 : 0;

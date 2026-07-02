@@ -15,6 +15,7 @@ const INITIAL_HUD: HudState = {
   carX: 0,
   carZ: 0,
   carHeading: 0,
+  racers: [],
 };
 
 export default function Game() {
