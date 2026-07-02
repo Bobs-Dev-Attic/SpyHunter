@@ -5,6 +5,7 @@ import { Lizard } from "./wildlife";
 const GROUND_SIZE = 420;
 
 export interface Collider {
+  id: number;
   x: number;
   z: number;
   radius: number;
@@ -85,22 +86,24 @@ function buildRock(): THREE.Mesh {
   return mesh;
 }
 
-function buildCactus(): THREE.Group {
+function buildCactus(): { group: THREE.Group; arms: THREE.Mesh[] } {
   const group = new THREE.Group();
   const mat = new THREE.MeshStandardMaterial({ color: 0x3f7d4a, flatShading: true, roughness: 0.85 });
   const core = new THREE.Mesh(new THREE.CapsuleGeometry(0.22, 1.1, 3, 6), mat);
   core.position.y = 0.75;
   core.castShadow = true;
   group.add(core);
+  const arms: THREE.Mesh[] = [];
   for (let i = 0; i < 2; i++) {
-    const arm = new THREE.Mesh(new THREE.CapsuleGeometry(0.14, 0.5, 3, 6), mat);
+    const arm = new THREE.Mesh(new THREE.CapsuleGeometry(0.14, 0.5, 3, 6), mat.clone());
     const side = i === 0 ? 1 : -1;
     arm.position.set(side * 0.28, 1.0, 0);
     arm.rotation.z = side * 0.9;
     arm.castShadow = true;
     group.add(arm);
+    arms.push(arm);
   }
-  return group;
+  return { group, arms };
 }
 
 // The play camera is a fixed-direction orthographic camera: it translates
@@ -177,14 +180,100 @@ const COLLIDER_RADIUS: Record<"tree" | "rock" | "cactus", number> = {
   cactus: 0.4,
 };
 
-export function buildEnvironment(track: Track): { group: THREE.Group; colliders: Collider[]; lizards: Lizard[] } {
+const DECORATION_MIN_IMPACT = 3;
+const DECORATION_DAMAGE_SCALE = 20;
+const TREE_TOPPLE_HEALTH = 0.6;
+const CACTUS_ARM_HEALTH = 0.5;
+const FALL_DURATION = 0.9;
+
+export interface DetachedArmEvent {
+  mesh: THREE.Object3D;
+  velocity: THREE.Vector3;
+  angularVelocity: THREE.Vector3;
+}
+
+/**
+ * Wraps a tree or cactus so a hard-enough car impact can topple it (trees)
+ * or snap an arm off (cacti) instead of it just being an inert collision
+ * cylinder forever. Rocks aren't wrapped -- they're hard enough to just
+ * shrug off a bumper.
+ */
+export class Decoration {
+  readonly object: THREE.Object3D;
+  readonly collider: Collider;
+  readonly kind: "tree" | "cactus";
+  health = 0;
+  falling = false;
+  fallen = false;
+  colliderRemoved = false;
+  private fallProgress = 0;
+  private readonly fallAxis = new THREE.Vector3(1, 0, 0);
+  private armsRemaining: THREE.Mesh[];
+
+  constructor(object: THREE.Object3D, collider: Collider, kind: "tree" | "cactus", arms: THREE.Mesh[] = []) {
+    this.object = object;
+    this.collider = collider;
+    this.kind = kind;
+    this.armsRemaining = arms;
+  }
+
+  /** Registers an impact; returns a detached cactus arm to hand to a debris system, if one broke off. */
+  registerHit(impactSpeed: number, worldDir: THREE.Vector3): DetachedArmEvent | null {
+    if (this.fallen || this.falling || impactSpeed < DECORATION_MIN_IMPACT) return null;
+    this.health = Math.min(1, this.health + impactSpeed / DECORATION_DAMAGE_SCALE);
+
+    if (this.kind === "tree" && this.health > TREE_TOPPLE_HEALTH) {
+      this.falling = true;
+      this.fallAxis.set(worldDir.z, 0, -worldDir.x).normalize();
+      return null;
+    }
+
+    if (this.kind === "cactus" && this.health > CACTUS_ARM_HEALTH && this.armsRemaining.length > 0) {
+      const arm = this.armsRemaining.pop()!;
+      this.health = 0.15;
+
+      const worldPos = new THREE.Vector3();
+      arm.getWorldPosition(worldPos);
+      const worldQuat = new THREE.Quaternion();
+      arm.getWorldQuaternion(worldQuat);
+      arm.parent?.remove(arm);
+      arm.position.copy(worldPos);
+      arm.quaternion.copy(worldQuat);
+
+      const velocity = worldDir.clone().multiplyScalar(2.5 + Math.random() * 2).setY(2.5 + Math.random() * 1.5);
+      const angularVelocity = new THREE.Vector3(
+        (Math.random() - 0.5) * 8,
+        (Math.random() - 0.5) * 8,
+        (Math.random() - 0.5) * 8,
+      );
+      return { mesh: arm, velocity, angularVelocity };
+    }
+
+    return null;
+  }
+
+  /** Advances the topple animation. Call every frame; cheap no-op once settled. */
+  update(dt: number) {
+    if (!this.falling || this.fallen) return;
+    this.fallProgress = Math.min(1, this.fallProgress + dt / FALL_DURATION);
+    const eased = 1 - Math.pow(1 - this.fallProgress, 2);
+    this.object.setRotationFromAxisAngle(this.fallAxis, eased * (Math.PI / 2 + 0.1));
+    if (this.fallProgress >= 1) this.fallen = true;
+  }
+}
+
+export function buildEnvironment(
+  track: Track,
+): { group: THREE.Group; colliders: Collider[]; lizards: Lizard[]; decorations: Decoration[] } {
   const group = new THREE.Group();
   group.add(buildSkyDome());
   group.add(buildGround());
   group.add(track.buildShoulderMesh());
 
-  const decorations = new THREE.Group();
+  const decorationGroup = new THREE.Group();
   const colliders: Collider[] = [];
+  const destructibles: Decoration[] = [];
+  let nextColliderId = 0;
   // Keep decorations clear of the road, curb, and sand shoulder entirely so
   // every collidable object sits out in the open desert friction tier.
   const minClearance = ROAD_WIDTH / 2 + CURB_WIDTH + SAND_SHOULDER_WIDTH + 2;
@@ -203,6 +292,7 @@ export function buildEnvironment(track: Track): { group: THREE.Group; colliders:
     const roll = Math.random();
     let item: THREE.Object3D;
     let kind: keyof typeof COLLIDER_RADIUS;
+    let arms: THREE.Mesh[] = [];
     if (roll < 0.45) {
       item = buildTree();
       kind = "tree";
@@ -210,7 +300,9 @@ export function buildEnvironment(track: Track): { group: THREE.Group; colliders:
       item = buildRock();
       kind = "rock";
     } else {
-      item = buildCactus();
+      const cactus = buildCactus();
+      item = cactus.group;
+      arms = cactus.arms;
       kind = "cactus";
     }
 
@@ -218,8 +310,12 @@ export function buildEnvironment(track: Track): { group: THREE.Group; colliders:
     item.position.set(x, 0, z);
     item.scale.setScalar(scale);
     item.rotation.y = Math.random() * Math.PI * 2;
-    decorations.add(item);
-    colliders.push({ x, z, radius: COLLIDER_RADIUS[kind] * scale });
+    decorationGroup.add(item);
+    const collider: Collider = { id: nextColliderId++, x, z, radius: COLLIDER_RADIUS[kind] * scale };
+    colliders.push(collider);
+    if (kind === "tree" || kind === "cactus") {
+      destructibles.push(new Decoration(item, collider, kind, arms));
+    }
     placed++;
   }
 
@@ -240,11 +336,11 @@ export function buildEnvironment(track: Track): { group: THREE.Group; colliders:
     if (track.distanceToCenterline(pos) < lizardClearance) continue;
 
     const lizard = new Lizard(pos);
-    decorations.add(lizard.group);
+    decorationGroup.add(lizard.group);
     lizards.push(lizard);
     lizardsPlaced++;
   }
 
-  group.add(decorations);
-  return { group, colliders, lizards };
+  group.add(decorationGroup);
+  return { group, colliders, lizards, decorations: destructibles };
 }
