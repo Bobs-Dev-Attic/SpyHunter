@@ -97,6 +97,18 @@ function buildCarMesh() {
   rearBumper.position.set(0, 0.16, -0.93);
   suspension.add(rearBumper);
 
+  const exhaustPipe = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.05, 0.05, 0.16, 8),
+    new THREE.MeshStandardMaterial({ color: 0x8a8a8a, roughness: 0.4, metalness: 0.7 }),
+  );
+  exhaustPipe.rotation.x = Math.PI / 2;
+  exhaustPipe.position.set(-0.3, 0.08, -1.0);
+  suspension.add(exhaustPipe);
+
+  const exhaustAnchor = new THREE.Object3D();
+  exhaustAnchor.position.set(-0.3, 0.1, -1.08);
+  suspension.add(exhaustAnchor);
+
   const cabin = new THREE.Mesh(new THREE.BoxGeometry(0.85, 0.36, 1.0), cabinMat);
   cabin.position.set(0, 0.62, -0.05);
   cabin.castShadow = true;
@@ -153,13 +165,14 @@ function buildCarMesh() {
   shadow.position.y = 0.01;
   root.add(shadow);
 
-  return { root, suspension, wheels };
+  return { root, suspension, wheels, exhaustAnchor };
 }
 
 export class Car {
   readonly root: THREE.Group;
   private readonly suspension: THREE.Group;
   private readonly wheels: THREE.Group[];
+  private readonly exhaustAnchor: THREE.Object3D;
 
   position = new THREE.Vector3();
   velocity = new THREE.Vector3();
@@ -176,10 +189,11 @@ export class Car {
   isSkidding = false;
 
   constructor(track: Track) {
-    const { root, suspension, wheels } = buildCarMesh();
+    const { root, suspension, wheels, exhaustAnchor } = buildCarMesh();
     this.root = root;
     this.suspension = suspension;
     this.wheels = wheels;
+    this.exhaustAnchor = exhaustAnchor;
 
     this.position.copy(track.startPosition);
     this.heading = track.startHeading;
@@ -201,6 +215,12 @@ export class Car {
   getWheelContact(index: number, target = new THREE.Vector3()): THREE.Vector3 {
     this.wheels[index].getWorldPosition(target);
     target.y = 0.025;
+    return target;
+  }
+
+  /** World-space tailpipe tip, for exhaust particle spawning. */
+  getExhaustPosition(target = new THREE.Vector3()): THREE.Vector3 {
+    this.exhaustAnchor.getWorldPosition(target);
     return target;
   }
 

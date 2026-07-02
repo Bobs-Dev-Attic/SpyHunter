@@ -1,69 +1,172 @@
 import * as THREE from "three";
 
-const MAX_PARTICLES = 240;
+let softDiscTexture: THREE.CanvasTexture | null = null;
+
+/** Shared soft radial-gradient sprite so smoke puffs read as billowy rather than flat dots. */
+function getSoftDiscTexture(): THREE.CanvasTexture {
+  if (softDiscTexture) return softDiscTexture;
+  const size = 64;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d")!;
+  const gradient = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+  gradient.addColorStop(0, "rgba(255,255,255,1)");
+  gradient.addColorStop(0.4, "rgba(255,255,255,0.7)");
+  gradient.addColorStop(1, "rgba(255,255,255,0)");
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, size, size);
+  softDiscTexture = new THREE.CanvasTexture(canvas);
+  return softDiscTexture;
+}
+
+export interface SmokeOptions {
+  maxParticles: number;
+  color: number;
+  /** Point size in screen pixels at spawn, randomized within this range. */
+  baseSize: [number, number];
+  /** Size multiplier reached by end of life (puffs expand as they disperse). */
+  growth: number;
+  opacity: [number, number];
+  lifetime: [number, number];
+  /** Fraction of velocity retained per second (air resistance). */
+  drag?: number;
+  /** Upward acceleration, world units/s^2 (buoyancy). */
+  rise?: number;
+}
 
 /**
- * Lightweight recycled point-sprite pool for dust/skid puffs. Avoids per-frame
- * allocation: particles are written into a ring buffer and dead ones are
- * parked far below the ground rather than removed.
+ * Recycled point-sprite pool for smoke-style effects (dirt kickup, exhaust).
+ * Unlike a plain PointsMaterial, a small custom shader drives per-particle
+ * size (grows with age) and opacity (fades with age) from two extra
+ * attributes computed on the CPU each frame — a flat dot doesn't read as
+ * smoke, a puff that expands and fades does. Dead slots are parked far below
+ * the ground rather than removed, so spawning never allocates.
  */
-export class DustEmitter {
+export class SmokeEmitter {
   readonly points: THREE.Points;
+  private readonly max: number;
+  private readonly growth: number;
+  private readonly drag: number;
+  private readonly rise: number;
   private readonly positions: Float32Array;
   private readonly velocities: Float32Array;
   private readonly ages: Float32Array;
   private readonly lifetimes: Float32Array;
+  private readonly baseSizes: Float32Array;
+  private readonly baseOpacities: Float32Array;
+  private readonly sizeAttr: Float32Array;
+  private readonly opacityAttr: Float32Array;
   private cursor = 0;
+  private readonly opts: SmokeOptions;
 
-  constructor() {
-    this.positions = new Float32Array(MAX_PARTICLES * 3);
-    this.velocities = new Float32Array(MAX_PARTICLES * 3);
-    this.ages = new Float32Array(MAX_PARTICLES).fill(999);
-    this.lifetimes = new Float32Array(MAX_PARTICLES).fill(1);
+  constructor(opts: SmokeOptions) {
+    this.opts = opts;
+    this.max = opts.maxParticles;
+    this.growth = opts.growth;
+    this.drag = opts.drag ?? 0.7;
+    this.rise = opts.rise ?? 0.5;
 
-    for (let i = 0; i < MAX_PARTICLES; i++) this.positions[i * 3 + 1] = -50;
+    this.positions = new Float32Array(this.max * 3);
+    this.velocities = new Float32Array(this.max * 3);
+    this.ages = new Float32Array(this.max).fill(999);
+    this.lifetimes = new Float32Array(this.max).fill(1);
+    this.baseSizes = new Float32Array(this.max);
+    this.baseOpacities = new Float32Array(this.max);
+    this.sizeAttr = new Float32Array(this.max);
+    this.opacityAttr = new Float32Array(this.max);
+
+    for (let i = 0; i < this.max; i++) this.positions[i * 3 + 1] = -50;
 
     const geo = new THREE.BufferGeometry();
     geo.setAttribute("position", new THREE.BufferAttribute(this.positions, 3));
-    const mat = new THREE.PointsMaterial({
-      color: 0xd8c090,
-      size: 0.55,
+    geo.setAttribute("aSize", new THREE.BufferAttribute(this.sizeAttr, 1));
+    geo.setAttribute("aOpacity", new THREE.BufferAttribute(this.opacityAttr, 1));
+
+    const mat = new THREE.ShaderMaterial({
+      uniforms: {
+        color: { value: new THREE.Color(opts.color) },
+        map: { value: getSoftDiscTexture() },
+      },
+      vertexShader: `
+        attribute float aSize;
+        attribute float aOpacity;
+        varying float vOpacity;
+        void main() {
+          vOpacity = aOpacity;
+          vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+          gl_PointSize = aSize;
+          gl_Position = projectionMatrix * mvPosition;
+        }
+      `,
+      fragmentShader: `
+        uniform vec3 color;
+        uniform sampler2D map;
+        varying float vOpacity;
+        void main() {
+          vec4 tex = texture2D(map, gl_PointCoord);
+          float a = tex.a * vOpacity;
+          if (a < 0.01) discard;
+          gl_FragColor = vec4(color, a);
+        }
+      `,
       transparent: true,
-      opacity: 0.55,
       depthWrite: false,
-      sizeAttenuation: true,
     });
+
     this.points = new THREE.Points(geo, mat);
     this.points.frustumCulled = false;
   }
 
-  spawn(pos: THREE.Vector3, count: number, spread: number) {
+  spawn(pos: THREE.Vector3, count: number, spread: number, forwardBias?: THREE.Vector3) {
+    const [sizeMin, sizeMax] = this.opts.baseSize;
+    const [opMin, opMax] = this.opts.opacity;
+    const [lifeMin, lifeMax] = this.opts.lifetime;
+
     for (let n = 0; n < count; n++) {
       const i = this.cursor;
-      this.cursor = (this.cursor + 1) % MAX_PARTICLES;
+      this.cursor = (this.cursor + 1) % this.max;
       this.positions[i * 3 + 0] = pos.x + (Math.random() - 0.5) * spread;
-      this.positions[i * 3 + 1] = 0.15;
+      this.positions[i * 3 + 1] = 0.15 + Math.random() * 0.15;
       this.positions[i * 3 + 2] = pos.z + (Math.random() - 0.5) * spread;
-      this.velocities[i * 3 + 0] = (Math.random() - 0.5) * 0.6;
-      this.velocities[i * 3 + 1] = 0.3 + Math.random() * 0.4;
-      this.velocities[i * 3 + 2] = (Math.random() - 0.5) * 0.6;
+
+      const bx = forwardBias ? forwardBias.x * 0.8 : 0;
+      const bz = forwardBias ? forwardBias.z * 0.8 : 0;
+      this.velocities[i * 3 + 0] = bx + (Math.random() - 0.5) * 0.8;
+      this.velocities[i * 3 + 1] = this.rise * (0.5 + Math.random() * 0.6);
+      this.velocities[i * 3 + 2] = bz + (Math.random() - 0.5) * 0.8;
+
       this.ages[i] = 0;
-      this.lifetimes[i] = 0.5 + Math.random() * 0.4;
+      this.lifetimes[i] = lifeMin + Math.random() * (lifeMax - lifeMin);
+      this.baseSizes[i] = sizeMin + Math.random() * (sizeMax - sizeMin);
+      this.baseOpacities[i] = opMin + Math.random() * (opMax - opMin);
     }
   }
 
   update(dt: number) {
-    for (let i = 0; i < MAX_PARTICLES; i++) {
+    const dragFactor = Math.max(0, 1 - this.drag * dt);
+    for (let i = 0; i < this.max; i++) {
       if (this.ages[i] > this.lifetimes[i]) continue;
       this.ages[i] += dt;
+      if (this.ages[i] > this.lifetimes[i]) {
+        this.positions[i * 3 + 1] = -50;
+        this.opacityAttr[i] = 0;
+        continue;
+      }
+
+      this.velocities[i * 3 + 0] *= dragFactor;
+      this.velocities[i * 3 + 2] *= dragFactor;
       this.positions[i * 3 + 0] += this.velocities[i * 3 + 0] * dt;
       this.positions[i * 3 + 1] += this.velocities[i * 3 + 1] * dt;
       this.positions[i * 3 + 2] += this.velocities[i * 3 + 2] * dt;
-      if (this.ages[i] > this.lifetimes[i]) {
-        this.positions[i * 3 + 1] = -50;
-      }
+
+      const t = this.ages[i] / this.lifetimes[i];
+      this.sizeAttr[i] = this.baseSizes[i] * THREE.MathUtils.lerp(1, this.growth, t);
+      this.opacityAttr[i] = this.baseOpacities[i] * (1 - t);
     }
     (this.points.geometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
+    (this.points.geometry.attributes.aSize as THREE.BufferAttribute).needsUpdate = true;
+    (this.points.geometry.attributes.aOpacity as THREE.BufferAttribute).needsUpdate = true;
   }
 }
 

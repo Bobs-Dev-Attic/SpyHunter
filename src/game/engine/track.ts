@@ -32,6 +32,48 @@ export interface TrackSample {
   tangent: THREE.Vector3;
 }
 
+let asphaltTexture: THREE.CanvasTexture | null = null;
+
+function makeAsphaltTexture(): THREE.CanvasTexture {
+  if (asphaltTexture) return asphaltTexture;
+
+  const size = 256;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d")!;
+  ctx.fillStyle = "#3d3d40";
+  ctx.fillRect(0, 0, size, size);
+
+  // Aggregate speckle — small light/dark flecks typical of asphalt.
+  for (let i = 0; i < 5000; i++) {
+    const x = Math.random() * size;
+    const y = Math.random() * size;
+    const shade = Math.random();
+    ctx.fillStyle = shade > 0.5 ? "rgba(210,205,195,0.10)" : "rgba(0,0,0,0.14)";
+    const r = Math.random() * 1.1 + 0.3;
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Faint tire-wear streaks along the direction of travel.
+  ctx.strokeStyle = "rgba(0,0,0,0.10)";
+  ctx.lineWidth = 14;
+  for (const xFrac of [0.32, 0.68]) {
+    ctx.beginPath();
+    ctx.moveTo(size * xFrac, 0);
+    ctx.lineTo(size * xFrac, size);
+    ctx.stroke();
+  }
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  asphaltTexture = tex;
+  return tex;
+}
+
 export class Track {
   readonly group = new THREE.Group();
   readonly samples: TrackSample[];
@@ -114,7 +156,11 @@ export class Track {
       const b = i * 2 + 1;
       const c = ((i + 1) % n) * 2;
       const d = ((i + 1) % n) * 2 + 1;
-      indices.push(a, c, b, b, c, d);
+      // Winding chosen so the computed normal points +Y (up toward the sky/
+      // camera) rather than into the ground — with the reverse winding the
+      // ribbon was backface-culled by the default FrontSide material and
+      // never actually rendered.
+      indices.push(a, b, c, b, d, c);
     }
 
     const geo = new THREE.BufferGeometry();
@@ -128,9 +174,9 @@ export class Track {
   private buildRoadMesh(): THREE.Mesh {
     const geo = this.buildRibbon(ROAD_WIDTH / 2, 0.02);
     const mat = new THREE.MeshStandardMaterial({
-      color: 0x8d8d92,
-      roughness: 0.95,
-      metalness: 0.0,
+      map: makeAsphaltTexture(),
+      roughness: 0.92,
+      metalness: 0.05,
     });
     const mesh = new THREE.Mesh(geo, mat);
     mesh.receiveShadow = true;
@@ -206,7 +252,12 @@ export class Track {
     const mesh = new THREE.Mesh(geo, mat);
     mesh.position.copy(this.startPosition);
     mesh.position.y = 0.05;
-    mesh.rotation.y = -this.startHeading;
+    // Aligns the plane's ROAD_WIDTH-wide local X axis with the track's side
+    // (perpendicular) vector, so the stripe crosses the road instead of
+    // running along it. (Previously negated, which pointed the wide axis
+    // down the track instead of across it — a long diagonal band mistaken
+    // for the road surface in every screenshot since the MVP.)
+    mesh.rotation.y = this.startHeading;
     return mesh;
   }
 

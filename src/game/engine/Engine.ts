@@ -3,7 +3,7 @@ import { ROAD_WIDTH, Track } from "./track";
 import { buildEnvironment, type Collider } from "./environment";
 import { Car } from "./car";
 import { InputController } from "./input";
-import { DustEmitter, SkidMarks } from "./effects";
+import { SkidMarks, SmokeEmitter } from "./effects";
 
 const VIEW_HEIGHT = 20;
 const CAMERA_OFFSET = new THREE.Vector3(24, 30, 24);
@@ -24,7 +24,11 @@ export class Engine {
   private track: Track;
   private car: Car;
   private input: InputController;
-  private dust: DustEmitter;
+  private dirtSmoke: SmokeEmitter;
+  private exhaust: SmokeEmitter;
+  private exhaustTimer = 0;
+  private readonly backwardBias = new THREE.Vector3();
+  private readonly exhaustPos = new THREE.Vector3();
   private skidMarks: SkidMarks;
   private colliders: Collider[];
 
@@ -58,8 +62,29 @@ export class Engine {
     this.car = new Car(this.track);
     this.scene.add(this.car.root);
 
-    this.dust = new DustEmitter();
-    this.scene.add(this.dust.points);
+    this.dirtSmoke = new SmokeEmitter({
+      maxParticles: 220,
+      color: 0xc9a878,
+      baseSize: [16, 26],
+      growth: 2.8,
+      opacity: [0.4, 0.6],
+      lifetime: [0.7, 1.1],
+      drag: 0.8,
+      rise: 0.6,
+    });
+    this.scene.add(this.dirtSmoke.points);
+
+    this.exhaust = new SmokeEmitter({
+      maxParticles: 120,
+      color: 0xd8d8d8,
+      baseSize: [6, 10],
+      growth: 2.2,
+      opacity: [0.25, 0.4],
+      lifetime: [0.5, 0.8],
+      drag: 0.6,
+      rise: 0.9,
+    });
+    this.scene.add(this.exhaust.points);
 
     this.skidMarks = new SkidMarks();
     this.scene.add(this.skidMarks.mesh);
@@ -142,10 +167,19 @@ export class Engine {
     this.car.resolveCollisions(this.colliders);
 
     const speedKmh = this.car.speedKmh;
+    const backward = this.backwardBias.copy(this.car.forward).negate();
     if ((this.car.isSkidding || this.car.isOffroad) && speedKmh > 8) {
-      this.dust.spawn(this.car.position, this.car.isSkidding ? 3 : 1, 1.6);
+      this.dirtSmoke.spawn(this.car.position, this.car.isSkidding ? 3 : 1, 1.6, backward);
     }
-    this.dust.update(dt);
+    this.dirtSmoke.update(dt);
+
+    this.exhaustTimer -= dt;
+    if (this.exhaustTimer <= 0) {
+      const underLoad = input.throttle > 0.4;
+      this.exhaust.spawn(this.car.getExhaustPosition(this.exhaustPos), underLoad ? 2 : 1, 0.08, backward);
+      this.exhaustTimer = (underLoad ? 0.05 : 0.15) + Math.random() * 0.03;
+    }
+    this.exhaust.update(dt);
 
     let skidWrote = false;
     for (const wheelIndex of [2, 3]) {
