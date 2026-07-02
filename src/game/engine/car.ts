@@ -1,20 +1,56 @@
 import * as THREE from "three";
 import type { InputState } from "./input";
 import type { Track } from "./track";
-import { ROAD_WIDTH } from "./track";
+import { CURB_WIDTH, ROAD_WIDTH, SAND_SHOULDER_WIDTH } from "./track";
+import type { Collider } from "./environment";
 
 const ENGINE_ACCEL = 15;
 const REVERSE_ACCEL = 8;
 const BRAKE_DECEL = 26;
-const DRAG = 0.65;
+// Rolling resistance while coasting (no throttle/brake). Kept low so the car
+// glides on momentum instead of snapping to a stop the instant you lift off.
+const DRAG = 0.22;
 const MAX_SPEED = 27;
 const MAX_REVERSE_SPEED = 10;
 const MAX_TURN_RATE = 2.9;
-const GRIP_NORMAL = 7.5;
-const GRIP_DRIFT = 1.4;
-const GRIP_OFFROAD = 2.6;
+// How quickly tires "catch" the heading change (lateral slip damping).
+const GRIP_ROAD = 5.5;
+const GRIP_CURB = 4.0;
+const GRIP_SHOULDER = 3.0;
+const GRIP_DESERT = 2.0;
+const GRIP_DRIFT = 1.3;
 const WHEEL_RADIUS = 0.28;
 const MAX_VISUAL_STEER = 0.5;
+// A car can't meaningfully change heading with the wheels not rolling — this
+// ramps turn authority up with speed instead of allowing a stationary spin.
+const TURN_SPEED_RAMP = 4.5;
+const CAR_COLLISION_RADIUS = 0.85;
+const COLLISION_RESTITUTION = 1.4;
+
+interface SurfaceProfile {
+  speedScale: number;
+  grip: number;
+  offroad: boolean;
+}
+
+function surfaceProfile(distanceFromCenterline: number): SurfaceProfile {
+  const roadHalf = ROAD_WIDTH / 2;
+  const curbHalf = roadHalf + CURB_WIDTH;
+  const shoulderHalf = curbHalf + SAND_SHOULDER_WIDTH;
+
+  if (distanceFromCenterline <= roadHalf) {
+    return { speedScale: 1, grip: GRIP_ROAD, offroad: false };
+  }
+  if (distanceFromCenterline <= curbHalf) {
+    // Rumble strip: still grippy, but the bumps knock some speed and bite off.
+    return { speedScale: 0.88, grip: GRIP_CURB, offroad: true };
+  }
+  if (distanceFromCenterline <= shoulderHalf) {
+    // Soft sand shoulder: forgiving to run wide onto, but noticeably slower.
+    return { speedScale: 0.72, grip: GRIP_SHOULDER, offroad: true };
+  }
+  return { speedScale: 0.5, grip: GRIP_DESERT, offroad: true };
+}
 
 function buildWheel(): THREE.Group {
   const pivot = new THREE.Group();
@@ -128,11 +164,16 @@ export class Car {
   position = new THREE.Vector3();
   velocity = new THREE.Vector3();
   heading = 0;
+  /** World-space forward/side basis from the current heading, refreshed every update(). */
+  forward = new THREE.Vector3(0, 0, 1);
+  side = new THREE.Vector3(1, 0, 0);
   private visualSteer = 0;
   private prevForwardSpeed = 0;
+  private impactPulse = 0;
 
   speedKmh = 0;
   isOffroad = false;
+  isSkidding = false;
 
   constructor(track: Track) {
     const { root, suspension, wheels } = buildCarMesh();
@@ -156,15 +197,25 @@ export class Car {
     return out.set(Math.sin(this.heading), 0, Math.cos(this.heading));
   }
 
+  /** World-space ground contact point for wheel index (0/1 front, 2/3 rear). */
+  getWheelContact(index: number, target = new THREE.Vector3()): THREE.Vector3 {
+    this.wheels[index].getWorldPosition(target);
+    target.y = 0.025;
+    return target;
+  }
+
   update(dt: number, input: InputState, track: Track) {
+    this.impactPulse *= Math.pow(0.0006, dt);
+
     const forward = this.forwardVector();
     const side = new THREE.Vector3(forward.z, 0, -forward.x);
 
     let forwardSpeed = this.velocity.dot(forward);
     let lateralSpeed = this.velocity.dot(side);
 
-    this.isOffroad = track.distanceToCenterline(this.position) > ROAD_WIDTH / 2;
-    const speedScale = this.isOffroad ? 0.55 : 1;
+    const surface = surfaceProfile(track.distanceToCenterline(this.position));
+    this.isOffroad = surface.offroad;
+    const speedScale = surface.speedScale;
 
     let accel = 0;
     if (input.throttle > 0) {
@@ -179,22 +230,34 @@ export class Car {
     }
     forwardSpeed += accel * dt;
 
-    const dragFactor = Math.max(0, 1 - DRAG * dt * (this.isOffroad ? 1.6 : 1));
+    // Rolling resistance only — much gentler than braking, so lifting off
+    // the throttle coasts instead of feeling like the brake is being held.
+    const dragFactor = Math.max(0, 1 - DRAG * dt * (this.isOffroad ? 1.5 : 1));
     forwardSpeed *= dragFactor;
 
     const maxFwd = MAX_SPEED * speedScale;
     forwardSpeed = THREE.MathUtils.clamp(forwardSpeed, -MAX_REVERSE_SPEED, maxFwd);
 
-    const speedForTurn = THREE.MathUtils.clamp(Math.abs(forwardSpeed) / 6, 0.22, 1);
+    // Turn authority ramps up with actual rolling speed and is ~0 at a
+    // standstill — steering alone can no longer spin the car in place.
+    const speedForTurn = 1 - Math.exp(-Math.abs(forwardSpeed) / TURN_SPEED_RAMP);
     const reverseSign = forwardSpeed < 0 ? -1 : 1;
     const turnRate = input.steer * MAX_TURN_RATE * speedForTurn * reverseSign;
     this.heading += turnRate * dt;
 
-    const grip = input.handbrake ? GRIP_DRIFT : this.isOffroad ? GRIP_OFFROAD : GRIP_NORMAL;
+    const grip = input.handbrake ? GRIP_DRIFT : surface.grip;
+    const slipMagnitude = Math.abs(lateralSpeed);
     lateralSpeed *= Math.max(0, 1 - grip * dt);
+
+    this.isSkidding =
+      (input.handbrake && Math.abs(forwardSpeed) > 7) ||
+      slipMagnitude > 3.2 ||
+      (input.brake > 0.6 && forwardSpeed > 9);
 
     const newForward = this.forwardVector();
     const newSide = new THREE.Vector3(newForward.z, 0, -newForward.x);
+    this.forward = newForward;
+    this.side = newSide;
     this.velocity
       .copy(newForward)
       .multiplyScalar(forwardSpeed)
@@ -208,11 +271,11 @@ export class Car {
 
     this.visualSteer = THREE.MathUtils.lerp(this.visualSteer, input.steer * MAX_VISUAL_STEER, 1 - Math.pow(0.001, dt));
 
-    const targetRoll = THREE.MathUtils.clamp(-lateralSpeed * 0.045, -0.16, 0.16);
-    const targetPitch = THREE.MathUtils.clamp(-forwardAccel * 0.012, -0.1, 0.1);
-    this.suspension.rotation.z = THREE.MathUtils.lerp(this.suspension.rotation.z, targetRoll, 1 - Math.pow(0.0005, dt));
-    this.suspension.rotation.x = THREE.MathUtils.lerp(this.suspension.rotation.x, targetPitch, 1 - Math.pow(0.0005, dt));
-    const bob = Math.max(0, Math.abs(lateralSpeed) * 0.004);
+    const targetRoll = THREE.MathUtils.clamp(-lateralSpeed * 0.055, -0.22, 0.22);
+    const targetPitch = THREE.MathUtils.clamp(-forwardAccel * 0.014, -0.14, 0.14);
+    this.suspension.rotation.z = THREE.MathUtils.lerp(this.suspension.rotation.z, targetRoll, 1 - Math.pow(0.0015, dt));
+    this.suspension.rotation.x = THREE.MathUtils.lerp(this.suspension.rotation.x, targetPitch, 1 - Math.pow(0.0015, dt));
+    const bob = Math.max(0, Math.abs(lateralSpeed) * 0.004) + this.impactPulse * 0.12;
     this.suspension.position.y = WHEEL_RADIUS - bob;
 
     for (const wheel of this.wheels) {
@@ -226,8 +289,38 @@ export class Car {
     this.syncTransform();
   }
 
+  /** Circle-vs-circle collision against static scenery (trees/rocks/cacti). */
+  resolveCollisions(colliders: Collider[]) {
+    let hit = false;
+    for (const c of colliders) {
+      const dx = this.position.x - c.x;
+      const dz = this.position.z - c.z;
+      const minDist = CAR_COLLISION_RADIUS + c.radius;
+      const distSq = dx * dx + dz * dz;
+      if (distSq >= minDist * minDist) continue;
+
+      const dist = Math.sqrt(Math.max(distSq, 1e-6));
+      const nx = dx / dist;
+      const nz = dz / dist;
+      const overlap = minDist - dist;
+      this.position.x += nx * overlap;
+      this.position.z += nz * overlap;
+
+      const vDotN = this.velocity.x * nx + this.velocity.z * nz;
+      if (vDotN < 0) {
+        this.velocity.x -= vDotN * nx * COLLISION_RESTITUTION;
+        this.velocity.z -= vDotN * nz * COLLISION_RESTITUTION;
+        this.impactPulse = Math.min(1, this.impactPulse + Math.abs(vDotN) / 14);
+        hit = true;
+      }
+    }
+    if (hit) this.syncTransform();
+    return hit;
+  }
+
   private syncTransform() {
     this.root.position.copy(this.position);
     this.root.rotation.y = this.heading;
+    this.root.updateMatrixWorld(true);
   }
 }

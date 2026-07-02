@@ -1,9 +1,9 @@
 import * as THREE from "three";
 import { ROAD_WIDTH, Track } from "./track";
-import { buildEnvironment } from "./environment";
+import { buildEnvironment, type Collider } from "./environment";
 import { Car } from "./car";
 import { InputController } from "./input";
-import { DustEmitter } from "./effects";
+import { DustEmitter, SkidMarks } from "./effects";
 
 const VIEW_HEIGHT = 20;
 const CAMERA_OFFSET = new THREE.Vector3(24, 30, 24);
@@ -25,6 +25,8 @@ export class Engine {
   private car: Car;
   private input: InputController;
   private dust: DustEmitter;
+  private skidMarks: SkidMarks;
+  private colliders: Collider[];
 
   private raf = 0;
   private lastTime = 0;
@@ -49,13 +51,18 @@ export class Engine {
 
     this.track = new Track();
     this.scene.add(this.track.group);
-    this.scene.add(buildEnvironment(this.track));
+    const environment = buildEnvironment(this.track);
+    this.scene.add(environment.group);
+    this.colliders = environment.colliders;
 
     this.car = new Car(this.track);
     this.scene.add(this.car.root);
 
     this.dust = new DustEmitter();
     this.scene.add(this.dust.points);
+
+    this.skidMarks = new SkidMarks();
+    this.scene.add(this.skidMarks.mesh);
 
     this.camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 500);
     this.camera.position.copy(this.car.position).add(CAMERA_OFFSET);
@@ -132,13 +139,20 @@ export class Engine {
 
     const input = this.input.state;
     this.car.update(dt, input, this.track);
+    this.car.resolveCollisions(this.colliders);
 
-    const forwardSpeed = this.car.speedKmh;
-    const drifting = input.handbrake && forwardSpeed > 15;
-    if ((drifting || this.car.isOffroad) && forwardSpeed > 8) {
-      this.dust.spawn(this.car.position, drifting ? 3 : 1, 1.6);
+    const speedKmh = this.car.speedKmh;
+    if ((this.car.isSkidding || this.car.isOffroad) && speedKmh > 8) {
+      this.dust.spawn(this.car.position, this.car.isSkidding ? 3 : 1, 1.6);
     }
     this.dust.update(dt);
+
+    let skidWrote = false;
+    for (const wheelIndex of [2, 3]) {
+      const contact = this.car.getWheelContact(wheelIndex);
+      skidWrote = this.skidMarks.mark(`w${wheelIndex}`, contact, this.car.side, this.car.isSkidding && speedKmh > 5) || skidWrote;
+    }
+    if (skidWrote) this.skidMarks.commit();
 
     this.updateLap(dt);
 
