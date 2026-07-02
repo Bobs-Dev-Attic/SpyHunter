@@ -1,8 +1,8 @@
 import * as THREE from "three";
 
-export const ROAD_WIDTH = 9;
-const CURB_WIDTH = 0.9;
-const SAND_SHOULDER_WIDTH = 5;
+export const ROAD_WIDTH = 13;
+export const CURB_WIDTH = 1.1;
+export const SAND_SHOULDER_WIDTH = 5;
 const SAMPLES_PER_SEGMENT = 24;
 
 // Control points are generated as a radial function r(theta) rather than

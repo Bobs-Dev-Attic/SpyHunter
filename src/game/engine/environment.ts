@@ -1,7 +1,13 @@
 import * as THREE from "three";
-import { Track } from "./track";
+import { CURB_WIDTH, ROAD_WIDTH, SAND_SHOULDER_WIDTH, Track } from "./track";
 
 const GROUND_SIZE = 420;
+
+export interface Collider {
+  x: number;
+  z: number;
+  radius: number;
+}
 
 function makeSandTexture(): THREE.CanvasTexture {
   const size = 256;
@@ -161,14 +167,26 @@ function buildSkyDome(): THREE.Mesh {
   return new THREE.Mesh(geo, mat);
 }
 
-export function buildEnvironment(track: Track): THREE.Group {
+// Base collision radius per decoration type (world units at scale 1), tuned
+// to roughly match each mesh's visible trunk/body footprint rather than its
+// full canopy/branch extent.
+const COLLIDER_RADIUS: Record<"tree" | "rock" | "cactus", number> = {
+  tree: 0.5,
+  rock: 0.55,
+  cactus: 0.4,
+};
+
+export function buildEnvironment(track: Track): { group: THREE.Group; colliders: Collider[] } {
   const group = new THREE.Group();
   group.add(buildSkyDome());
   group.add(buildGround());
   group.add(track.buildShoulderMesh());
 
   const decorations = new THREE.Group();
-  const minClearance = 8.5;
+  const colliders: Collider[] = [];
+  // Keep decorations clear of the road, curb, and sand shoulder entirely so
+  // every collidable object sits out in the open desert friction tier.
+  const minClearance = ROAD_WIDTH / 2 + CURB_WIDTH + SAND_SHOULDER_WIDTH + 2;
   const half = GROUND_SIZE / 2 - 10;
   const targetCount = 260;
   let placed = 0;
@@ -183,17 +201,27 @@ export function buildEnvironment(track: Track): THREE.Group {
 
     const roll = Math.random();
     let item: THREE.Object3D;
-    if (roll < 0.45) item = buildTree();
-    else if (roll < 0.75) item = buildRock();
-    else item = buildCactus();
+    let kind: keyof typeof COLLIDER_RADIUS;
+    if (roll < 0.45) {
+      item = buildTree();
+      kind = "tree";
+    } else if (roll < 0.75) {
+      item = buildRock();
+      kind = "rock";
+    } else {
+      item = buildCactus();
+      kind = "cactus";
+    }
 
+    const scale = 0.8 + Math.random() * 0.6;
     item.position.set(x, 0, z);
-    item.scale.setScalar(0.8 + Math.random() * 0.6);
+    item.scale.setScalar(scale);
     item.rotation.y = Math.random() * Math.PI * 2;
     decorations.add(item);
+    colliders.push({ x, z, radius: COLLIDER_RADIUS[kind] * scale });
     placed++;
   }
 
   group.add(decorations);
-  return group;
+  return { group, colliders };
 }
