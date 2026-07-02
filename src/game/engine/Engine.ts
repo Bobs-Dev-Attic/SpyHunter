@@ -4,8 +4,17 @@ import { buildEnvironment, type Collider } from "./environment";
 import { Car } from "./car";
 import { InputController } from "./input";
 import { SkidMarks, SmokeEmitter } from "./effects";
+import { BirdFlock, Lizard } from "./wildlife";
 
-const VIEW_HEIGHT = 20;
+const BASE_VIEW_HEIGHT = 20;
+const MIN_VIEW_HEIGHT = 14;
+const MAX_VIEW_HEIGHT = 30;
+// Zoom out with speed...
+const SPEED_ZOOM_FACTOR = 0.09;
+// ...and pull in an extra bit when braking hard, on top of the speed term.
+const DECEL_ZOOM_THRESHOLD = 6;
+const DECEL_ZOOM_FACTOR = 0.5;
+const MAX_DECEL_ZOOM_PULL = 6;
 const CAMERA_OFFSET = new THREE.Vector3(24, 30, 24);
 const MIN_LAP_TIME = 4;
 
@@ -15,6 +24,9 @@ export interface HudState {
   bestLap: number | null;
   speedKmh: number;
   offroad: boolean;
+  carX: number;
+  carZ: number;
+  carHeading: number;
 }
 
 export class Engine {
@@ -31,6 +43,8 @@ export class Engine {
   private readonly exhaustPos = new THREE.Vector3();
   private skidMarks: SkidMarks;
   private colliders: Collider[];
+  private lizards: Lizard[];
+  private birdFlocks: BirdFlock[] = [];
 
   private raf = 0;
   private lastTime = 0;
@@ -45,6 +59,10 @@ export class Engine {
   private hudListeners = new Set<(hud: HudState) => void>();
   private resizeObserver: ResizeObserver;
 
+  private containerWidth = 1;
+  private containerHeight = 1;
+  private currentViewHeight = BASE_VIEW_HEIGHT;
+
   constructor(private canvas: HTMLCanvasElement, private container: HTMLElement) {
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: "high-performance" });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -58,9 +76,15 @@ export class Engine {
     const environment = buildEnvironment(this.track);
     this.scene.add(environment.group);
     this.colliders = environment.colliders;
+    // Lizard meshes are already parented under environment.group (added
+    // above); we just keep references here to drive their per-frame update.
+    this.lizards = environment.lizards;
 
     this.car = new Car(this.track);
     this.scene.add(this.car.root);
+
+    this.birdFlocks = this.createBirdFlocks();
+    for (const flock of this.birdFlocks) this.scene.add(flock.group);
 
     this.dirtSmoke = new SmokeEmitter({
       maxParticles: 220,
@@ -107,6 +131,33 @@ export class Engine {
     this.raf = requestAnimationFrame(this.loop);
   }
 
+  private createBirdFlocks(): BirdFlock[] {
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minZ = Infinity;
+    let maxZ = -Infinity;
+    for (const { point } of this.track.samples) {
+      minX = Math.min(minX, point.x);
+      maxX = Math.max(maxX, point.x);
+      minZ = Math.min(minZ, point.z);
+      maxZ = Math.max(maxZ, point.z);
+    }
+    const centerX = (minX + maxX) / 2;
+    const centerZ = (minZ + maxZ) / 2;
+    const spanX = maxX - minX;
+    const spanZ = maxZ - minZ;
+
+    const flockOffsets: [number, number][] = [
+      [-0.3, -0.25],
+      [0.32, 0.1],
+      [-0.05, 0.35],
+    ];
+    return flockOffsets.map(([fx, fz]) => {
+      const center = new THREE.Vector3(centerX + fx * spanX, 0, centerZ + fz * spanZ);
+      return new BirdFlock(center, 3, 6 + Math.random() * 4, 14 + Math.random() * 6);
+    });
+  }
+
   private setupLights() {
     const hemi = new THREE.HemisphereLight(0xbfd9ea, 0xcaa974, 0.65);
     this.scene.add(hemi);
@@ -134,23 +185,38 @@ export class Engine {
   }
 
   private onResize() {
-    const width = this.container.clientWidth;
-    const height = this.container.clientHeight;
-    const aspect = Math.max(width / Math.max(height, 1), 0.1);
-    const viewWidth = VIEW_HEIGHT * aspect;
+    this.containerWidth = this.container.clientWidth;
+    this.containerHeight = this.container.clientHeight;
+    this.applyFrustum(this.currentViewHeight);
+    this.renderer.setSize(this.containerWidth, this.containerHeight, false);
+  }
+
+  /** Re-derives the camera frustum for the current container size and zoom level. Cheap enough to call every frame. */
+  private applyFrustum(viewHeight: number) {
+    const aspect = Math.max(this.containerWidth / Math.max(this.containerHeight, 1), 0.1);
+    const viewWidth = viewHeight * aspect;
 
     this.camera.left = -viewWidth / 2;
     this.camera.right = viewWidth / 2;
-    this.camera.top = VIEW_HEIGHT / 2;
-    this.camera.bottom = -VIEW_HEIGHT / 2;
+    this.camera.top = viewHeight / 2;
+    this.camera.bottom = -viewHeight / 2;
     this.camera.updateProjectionMatrix();
-
-    this.renderer.setSize(width, height, false);
   }
 
   onHudUpdate(cb: (hud: HudState) => void) {
     this.hudListeners.add(cb);
     return () => this.hudListeners.delete(cb);
+  }
+
+  /** Track centerline points (subsampled) for drawing a minimap. Static for the session, so callers can cache it. */
+  getTrackOutline(): [number, number][] {
+    const step = 4;
+    const points: [number, number][] = [];
+    for (let i = 0; i < this.track.samples.length; i += step) {
+      const p = this.track.samples[i].point;
+      points.push([p.x, p.z]);
+    }
+    return points;
   }
 
   setTouchInput(throttle: number, brake: number, steer: number, handbrake = false) {
@@ -188,7 +254,11 @@ export class Engine {
     }
     if (skidWrote) this.skidMarks.commit();
 
+    for (const lizard of this.lizards) lizard.update(dt);
+    for (const flock of this.birdFlocks) flock.update(dt);
+
     this.updateLap(dt);
+    this.updateZoom(dt);
 
     this.camera.position.copy(this.car.position).add(CAMERA_OFFSET);
     this.camera.lookAt(this.car.position);
@@ -202,6 +272,9 @@ export class Engine {
         bestLap: this.bestLapTime,
         speedKmh: this.car.speedKmh,
         offroad: this.car.isOffroad,
+        carX: this.car.position.x,
+        carZ: this.car.position.z,
+        carHeading: this.car.heading,
       });
     }
 
@@ -233,6 +306,25 @@ export class Engine {
       this.currentLapTime = 0;
     }
     this.prevLapIndex = idx;
+  }
+
+  /** Zooms out with speed and pulls in an extra bit under hard braking, then eases back to the base level. */
+  private updateZoom(dt: number) {
+    const speedTerm = this.car.speedKmh * SPEED_ZOOM_FACTOR;
+
+    const decel = -this.car.forwardAccel;
+    const decelPulse =
+      decel > DECEL_ZOOM_THRESHOLD
+        ? Math.min((decel - DECEL_ZOOM_THRESHOLD) * DECEL_ZOOM_FACTOR, MAX_DECEL_ZOOM_PULL)
+        : 0;
+
+    const target = THREE.MathUtils.clamp(
+      BASE_VIEW_HEIGHT + speedTerm - decelPulse,
+      MIN_VIEW_HEIGHT,
+      MAX_VIEW_HEIGHT,
+    );
+    this.currentViewHeight = THREE.MathUtils.lerp(this.currentViewHeight, target, 1 - Math.pow(0.01, dt));
+    this.applyFrustum(this.currentViewHeight);
   }
 
   dispose() {

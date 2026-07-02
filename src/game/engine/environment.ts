@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import { CURB_WIDTH, ROAD_WIDTH, SAND_SHOULDER_WIDTH, Track } from "./track";
+import { Lizard } from "./wildlife";
 
 const GROUND_SIZE = 420;
 
@@ -176,7 +177,7 @@ const COLLIDER_RADIUS: Record<"tree" | "rock" | "cactus", number> = {
   cactus: 0.4,
 };
 
-export function buildEnvironment(track: Track): { group: THREE.Group; colliders: Collider[] } {
+export function buildEnvironment(track: Track): { group: THREE.Group; colliders: Collider[]; lizards: Lizard[] } {
   const group = new THREE.Group();
   group.add(buildSkyDome());
   group.add(buildGround());
@@ -222,6 +223,28 @@ export function buildEnvironment(track: Track): { group: THREE.Group; colliders:
     placed++;
   }
 
+  // Lizards are small and non-solid (no collider), so they're allowed to sit
+  // a bit closer to the road than the trees/rocks/cacti -- just past the
+  // sand shoulder, like they're basking at the road's edge.
+  const lizards: Lizard[] = [];
+  const lizardClearance = ROAD_WIDTH / 2 + CURB_WIDTH + SAND_SHOULDER_WIDTH + 0.5;
+  const targetLizardCount = 16;
+  let lizardsPlaced = 0;
+  let lizardAttempts = 0;
+
+  while (lizardsPlaced < targetLizardCount && lizardAttempts < targetLizardCount * 15) {
+    lizardAttempts++;
+    const x = (Math.random() - 0.5) * 2 * half;
+    const z = (Math.random() - 0.5) * 2 * half;
+    const pos = new THREE.Vector3(x, 0, z);
+    if (track.distanceToCenterline(pos) < lizardClearance) continue;
+
+    const lizard = new Lizard(pos);
+    decorations.add(lizard.group);
+    lizards.push(lizard);
+    lizardsPlaced++;
+  }
+
   group.add(decorations);
-  return { group, colliders };
+  return { group, colliders, lizards };
 }

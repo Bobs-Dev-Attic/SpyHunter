@@ -187,6 +187,8 @@ export class Car {
   speedKmh = 0;
   isOffroad = false;
   isSkidding = false;
+  /** Forward acceleration (m/s^2, signed), exposed for camera-feel hooks like braking zoom-in. */
+  forwardAccel = 0;
 
   constructor(track: Track) {
     const { root, suspension, wheels, exhaustAnchor } = buildCarMesh();
@@ -260,9 +262,13 @@ export class Car {
 
     // Turn authority ramps up with actual rolling speed and is ~0 at a
     // standstill — steering alone can no longer spin the car in place.
+    // Negated: with forward = (sin(heading), 0, cos(heading)), increasing
+    // heading rotates the car counter-clockwise in bird's-eye view, which is
+    // a left turn -- so a positive (rightward) steer input must *decrease*
+    // heading to actually turn the car right.
     const speedForTurn = 1 - Math.exp(-Math.abs(forwardSpeed) / TURN_SPEED_RAMP);
     const reverseSign = forwardSpeed < 0 ? -1 : 1;
-    const turnRate = input.steer * MAX_TURN_RATE * speedForTurn * reverseSign;
+    const turnRate = -input.steer * MAX_TURN_RATE * speedForTurn * reverseSign;
     this.heading += turnRate * dt;
 
     const grip = input.handbrake ? GRIP_DRIFT : surface.grip;
@@ -288,8 +294,9 @@ export class Car {
     const forwardAccel = (forwardSpeed - this.prevForwardSpeed) / Math.max(dt, 1e-4);
     this.prevForwardSpeed = forwardSpeed;
     this.speedKmh = Math.abs(forwardSpeed) * 3.6;
+    this.forwardAccel = forwardAccel;
 
-    this.visualSteer = THREE.MathUtils.lerp(this.visualSteer, input.steer * MAX_VISUAL_STEER, 1 - Math.pow(0.001, dt));
+    this.visualSteer = THREE.MathUtils.lerp(this.visualSteer, -input.steer * MAX_VISUAL_STEER, 1 - Math.pow(0.001, dt));
 
     const targetRoll = THREE.MathUtils.clamp(-lateralSpeed * 0.055, -0.22, 0.22);
     const targetPitch = THREE.MathUtils.clamp(-forwardAccel * 0.014, -0.14, 0.14);
