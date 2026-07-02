@@ -37,6 +37,12 @@ export interface HudState {
   carZ: number;
   carHeading: number;
   racers: RacerBlip[];
+  rpm: number;
+  fuelPercent: number;
+  oilTempC: number;
+  checkEngineOn: boolean;
+  lowFuel: boolean;
+  handbrakeOn: boolean;
 }
 
 export class Engine {
@@ -368,6 +374,12 @@ export class Engine {
         carZ: this.car.position.z,
         carHeading: this.car.heading,
         racers: this.racers.map((r) => ({ x: r.car.position.x, z: r.car.position.z, color: r.car.color })),
+        rpm: this.car.rpm,
+        fuelPercent: this.car.fuelPercent,
+        oilTempC: this.car.oilTempC,
+        checkEngineOn: this.car.checkEngineOn,
+        lowFuel: this.car.lowFuel,
+        handbrakeOn: this.car.handbrakeOn,
       });
     }
 

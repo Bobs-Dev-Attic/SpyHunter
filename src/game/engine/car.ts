@@ -64,6 +64,26 @@ const WHEEL_LOCAL_XZ: readonly [number, number][] = [
   [-0.55, -0.68],
 ];
 
+// Instrument-panel telemetry. RPM is derived from wheel speed through a
+// simple auto-shifting virtual gearbox (not connected to the arcade drive
+// physics above, purely cosmetic) so the tachometer sweeps and saws like a
+// real one instead of tracking speed 1:1. Fuel drains with throttle use and
+// cuts power at empty; oil temp rises with sustained load/damage/fire and
+// drives the check-engine light along with damage/fire themselves.
+const IDLE_RPM = 850;
+const REDLINE_RPM = 7000;
+const GEAR_RATIOS = [3.8, 2.5, 1.8, 1.35, 1.05, 0.85];
+const FINAL_DRIVE = 3.9;
+const UPSHIFT_RPM = 6500;
+const DOWNSHIFT_RPM = 2200;
+export const FUEL_CAPACITY = 100;
+const FUEL_BURN_IDLE = 0.05;
+const FUEL_BURN_LOAD = 0.4;
+const LOW_FUEL_THRESHOLD = 15;
+const OIL_TEMP_IDLE = 85;
+const OIL_TEMP_MAX = 140;
+const OIL_TEMP_WARN = 122;
+
 export interface DetachEvent {
   mesh: THREE.Object3D;
   velocity: THREE.Vector3;
@@ -236,18 +256,9 @@ function buildCarMesh(colors: CarColors, carNumber: number) {
     return wheel;
   });
 
-  const shadowGeo = new THREE.CircleGeometry(1.3, 16);
-  shadowGeo.rotateX(-Math.PI / 2);
-  const shadowMat = new THREE.MeshBasicMaterial({
-    color: 0x000000,
-    transparent: true,
-    opacity: 0.22,
-    depthWrite: false,
-  });
-  const shadow = new THREE.Mesh(shadowGeo, shadowMat);
-  shadow.position.y = 0.01;
-  root.add(shadow);
-
+  // No fake flat-circle blob here -- the body/cabin/wheels above all cast
+  // real shadows onto the (shadow-receiving) ground/road/shoulder meshes, so
+  // the car gets an actual sun-cast shadow instead of a painted-on disc.
   return {
     root,
     suspension,
@@ -294,6 +305,21 @@ export class Car {
   tireLost: [boolean, boolean, boolean, boolean] = [false, false, false, false];
   private readonly detachedParts = new Set<string>();
   private pendingDetachments: DetachEvent[] = [];
+
+  /** Instrument-panel telemetry, purely cosmetic (doesn't feed back into drive physics except at empty fuel). */
+  rpm = IDLE_RPM;
+  fuelPercent = FUEL_CAPACITY;
+  oilTempC = OIL_TEMP_IDLE;
+  handbrakeOn = false;
+  private gear = 0;
+
+  get checkEngineOn(): boolean {
+    return this.isOnFire || this.oilTempC > OIL_TEMP_WARN || this.damage > 0.5;
+  }
+
+  get lowFuel(): boolean {
+    return this.fuelPercent < LOW_FUEL_THRESHOLD;
+  }
 
   constructor(track: Track, colors: CarColors = DEFAULT_CAR_COLORS, carNumber = 1) {
     this.color = colors.body;
@@ -352,9 +378,10 @@ export class Car {
     this.isOffroad = surface.offroad;
     const speedScale = surface.speedScale;
 
+    const fuelFactor = this.fuelPercent > 0 ? 1 : 0;
     let accel = 0;
     if (input.throttle > 0) {
-      accel += input.throttle * ENGINE_ACCEL * speedScale;
+      accel += input.throttle * ENGINE_ACCEL * speedScale * fuelFactor;
     }
     if (input.brake > 0) {
       if (forwardSpeed > 0.4) {
@@ -457,7 +484,31 @@ export class Car {
       spin.rotation.x -= (forwardSpeed / WHEEL_RADIUS) * dt;
     }
 
+    this.handbrakeOn = input.handbrake;
+    this.updateTelemetry(dt, input, forwardSpeed);
+
     this.syncTransform();
+  }
+
+  /** Cosmetic instrument-panel simulation: virtual auto-shifting gearbox for RPM, fuel burn, oil temp. */
+  private updateTelemetry(dt: number, input: InputState, forwardSpeed: number) {
+    const wheelRpm = (Math.abs(forwardSpeed) / WHEEL_RADIUS) * (60 / (2 * Math.PI));
+    let rawRpm = wheelRpm * GEAR_RATIOS[this.gear] * FINAL_DRIVE;
+    if (rawRpm > UPSHIFT_RPM && this.gear < GEAR_RATIOS.length - 1) {
+      this.gear++;
+    } else if (rawRpm < DOWNSHIFT_RPM && this.gear > 0) {
+      this.gear--;
+    }
+    rawRpm = wheelRpm * GEAR_RATIOS[this.gear] * FINAL_DRIVE;
+    const targetRpm = THREE.MathUtils.clamp(Math.max(rawRpm, IDLE_RPM) + input.throttle * 400, IDLE_RPM, REDLINE_RPM);
+    this.rpm = THREE.MathUtils.lerp(this.rpm, targetRpm, 1 - Math.pow(0.001, dt));
+
+    this.fuelPercent = Math.max(0, this.fuelPercent - (FUEL_BURN_IDLE + input.throttle * FUEL_BURN_LOAD) * dt);
+
+    const targetOilTemp = this.isOnFire
+      ? OIL_TEMP_MAX
+      : OIL_TEMP_IDLE + (this.rpm / REDLINE_RPM) * 35 + this.damage * 20;
+    this.oilTempC = THREE.MathUtils.lerp(this.oilTempC, targetOilTemp, 1 - Math.pow(0.02, dt));
   }
 
   /** Circle-vs-circle collision against static scenery (trees/rocks/cacti). */

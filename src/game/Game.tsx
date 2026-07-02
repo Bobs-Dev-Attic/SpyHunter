@@ -5,6 +5,7 @@ import { Engine, type HudState } from "@/game/engine/Engine";
 import { Hud } from "@/game/Hud";
 import { TouchControls } from "@/game/TouchControls";
 import { MiniMap } from "@/game/MiniMap";
+import { InstrumentPanel } from "@/game/InstrumentPanel";
 
 const INITIAL_HUD: HudState = {
   currentTime: 0,
@@ -16,6 +17,12 @@ const INITIAL_HUD: HudState = {
   carZ: 0,
   carHeading: 0,
   racers: [],
+  rpm: 850,
+  fuelPercent: 100,
+  oilTempC: 85,
+  checkEngineOn: false,
+  lowFuel: false,
+  handbrakeOn: false,
 };
 
 export default function Game() {
@@ -53,6 +60,7 @@ export default function Game() {
     <div ref={containerRef} style={{ position: "fixed", inset: 0, background: "#1a1710" }}>
       <canvas ref={canvasRef} style={{ display: "block", width: "100%", height: "100%" }} />
       <Hud hud={hud} />
+      <InstrumentPanel hud={hud} compact={isTouch} />
       {trackPoints.length > 0 && <MiniMap hud={hud} trackPoints={trackPoints} />}
       {isTouch && (
         <TouchControls
