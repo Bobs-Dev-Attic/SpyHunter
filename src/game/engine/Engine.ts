@@ -5,6 +5,7 @@ import { Car } from "./car";
 import { InputController } from "./input";
 import { SkidMarks, SmokeEmitter } from "./effects";
 import { BirdFlock, Lizard } from "./wildlife";
+import { AI_PROFILES, AIRacer, buildStartingGrid } from "./aiRacer";
 
 const BASE_VIEW_HEIGHT = 20;
 const MIN_VIEW_HEIGHT = 14;
@@ -45,6 +46,8 @@ export class Engine {
   private colliders: Collider[];
   private lizards: Lizard[];
   private birdFlocks: BirdFlock[] = [];
+  private racers: AIRacer[] = [];
+  private readonly allCars: Car[] = [];
 
   private raf = 0;
   private lastTime = 0;
@@ -82,6 +85,13 @@ export class Engine {
 
     this.car = new Car(this.track);
     this.scene.add(this.car.root);
+
+    const grid = buildStartingGrid(this.track, AI_PROFILES.length);
+    this.racers = AI_PROFILES.map(
+      (profile, i) => new AIRacer(this.track, profile, grid[i].position, grid[i].heading),
+    );
+    for (const racer of this.racers) this.scene.add(racer.car.root);
+    this.allCars = [this.car, ...this.racers.map((r) => r.car)];
 
     this.birdFlocks = this.createBirdFlocks();
     for (const flock of this.birdFlocks) this.scene.add(flock.group);
@@ -230,7 +240,14 @@ export class Engine {
 
     const input = this.input.state;
     this.car.update(dt, input, this.track);
-    this.car.resolveCollisions(this.colliders);
+    for (const racer of this.racers) racer.update(dt, this.track, this.allCars);
+
+    for (const car of this.allCars) car.resolveCollisions(this.colliders);
+    for (let i = 0; i < this.allCars.length; i++) {
+      for (let j = i + 1; j < this.allCars.length; j++) {
+        this.allCars[i].resolveCarCollision(this.allCars[j]);
+      }
+    }
 
     const speedKmh = this.car.speedKmh;
     const backward = this.backwardBias.copy(this.car.forward).negate();
