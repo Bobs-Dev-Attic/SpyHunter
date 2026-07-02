@@ -24,8 +24,15 @@ const MAX_VISUAL_STEER = 0.5;
 // A car can't meaningfully change heading with the wheels not rolling — this
 // ramps turn authority up with speed instead of allowing a stationary spin.
 const TURN_SPEED_RAMP = 4.5;
-const CAR_COLLISION_RADIUS = 0.85;
+export const CAR_COLLISION_RADIUS = 0.85;
 const COLLISION_RESTITUTION = 1.4;
+
+export interface CarColors {
+  body: number;
+  stripe: number;
+}
+
+export const DEFAULT_CAR_COLORS: CarColors = { body: 0x2255cc, stripe: 0xf2f2f2 };
 
 interface SurfaceProfile {
   speedScale: number;
@@ -68,15 +75,15 @@ function buildWheel(): THREE.Group {
   return pivot;
 }
 
-function buildCarMesh() {
+function buildCarMesh(colors: CarColors) {
   const root = new THREE.Group();
 
   const suspension = new THREE.Group();
   suspension.position.y = WHEEL_RADIUS;
   root.add(suspension);
 
-  const bodyMat = new THREE.MeshStandardMaterial({ color: 0x2255cc, roughness: 0.45, metalness: 0.15 });
-  const bumperMat = new THREE.MeshStandardMaterial({ color: 0xf2f2f2, roughness: 0.5 });
+  const bodyMat = new THREE.MeshStandardMaterial({ color: colors.body, roughness: 0.45, metalness: 0.15 });
+  const bumperMat = new THREE.MeshStandardMaterial({ color: colors.stripe, roughness: 0.5 });
   const cabinMat = new THREE.MeshStandardMaterial({ color: 0xf5f5f0, roughness: 0.4 });
   const glassMat = new THREE.MeshStandardMaterial({ color: 0x1a2733, roughness: 0.2, metalness: 0.6 });
 
@@ -190,8 +197,8 @@ export class Car {
   /** Forward acceleration (m/s^2, signed), exposed for camera-feel hooks like braking zoom-in. */
   forwardAccel = 0;
 
-  constructor(track: Track) {
-    const { root, suspension, wheels, exhaustAnchor } = buildCarMesh();
+  constructor(track: Track, colors: CarColors = DEFAULT_CAR_COLORS) {
+    const { root, suspension, wheels, exhaustAnchor } = buildCarMesh(colors);
     this.root = root;
     this.suspension = suspension;
     this.wheels = wheels;
@@ -343,6 +350,48 @@ export class Car {
     }
     if (hit) this.syncTransform();
     return hit;
+  }
+
+  /**
+   * Mutual circle-vs-circle collision against another car. Unlike
+   * resolveCollisions (a static obstacle pushes only the car), both cars
+   * here are dynamic: the overlap is split 50/50 and both velocities get an
+   * impulse along the collision normal, so a bump reads as two cars
+   * glancing off each other rather than one car hitting a wall. Call once
+   * per pair per frame (order doesn't matter, the response is symmetric).
+   */
+  resolveCarCollision(other: Car): boolean {
+    const dx = this.position.x - other.position.x;
+    const dz = this.position.z - other.position.z;
+    const minDist = CAR_COLLISION_RADIUS * 2;
+    const distSq = dx * dx + dz * dz;
+    if (distSq >= minDist * minDist) return false;
+
+    const dist = Math.sqrt(Math.max(distSq, 1e-6));
+    const nx = dx / dist;
+    const nz = dz / dist;
+    const overlap = (minDist - dist) / 2;
+    this.position.x += nx * overlap;
+    this.position.z += nz * overlap;
+    other.position.x -= nx * overlap;
+    other.position.z -= nz * overlap;
+
+    const relVx = this.velocity.x - other.velocity.x;
+    const relVz = this.velocity.z - other.velocity.z;
+    const vDotN = relVx * nx + relVz * nz;
+    if (vDotN < 0) {
+      const impulse = vDotN * COLLISION_RESTITUTION * 0.5;
+      this.velocity.x -= impulse * nx;
+      this.velocity.z -= impulse * nz;
+      other.velocity.x += impulse * nx;
+      other.velocity.z += impulse * nz;
+      this.impactPulse = Math.min(1, this.impactPulse + Math.abs(vDotN) / 14);
+      other.impactPulse = Math.min(1, other.impactPulse + Math.abs(vDotN) / 14);
+    }
+
+    this.syncTransform();
+    other.syncTransform();
+    return true;
   }
 
   private syncTransform() {
